@@ -54,6 +54,10 @@
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><polygon points="5,3 19,12 5,21" fill="currentColor"/></svg>
         <span>Search</span>
       </button>
+      <button class="btn btn-max" id="btn-max-mode" title="Chạy tới đủ điểm hôm nay (Max Mode)">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" fill="currentColor"/></svg>
+        <span>Max</span>
+      </button>
       <button class="btn btn-danger" id="btn-stop" title="Dừng lại">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><rect x="4" y="4" width="16" height="16" rx="2" fill="currentColor"/></svg>
         <span>Stop</span>
@@ -81,6 +85,37 @@
 
   <!-- ===== EXPANDED SECTION: CONFIG ===== -->
   <div class="expanded-section" id="expanded-section">
+    <!-- Daily Progress Panel -->
+    <div class="daily-panel glass-panel" id="daily-panel">
+      <div class="panel-header">
+        <span>📅 Tiến độ hôm nay</span>
+        <span class="auto-save-indicator" id="auto-save-indicator">✓ Saved</span>
+      </div>
+      <div class="daily-body">
+        <div class="daily-stats-row">
+          <div class="daily-stat-item">
+            <span class="daily-stat-value" id="daily-earned">+0 pts</span>
+            <span class="daily-stat-label">Kiếm hôm nay</span>
+          </div>
+          <div class="daily-stat-item">
+            <span class="daily-stat-value" id="daily-searches">~0 lần</span>
+            <span class="daily-stat-label">Đã search</span>
+          </div>
+          <div class="daily-stat-item">
+            <span class="daily-stat-value" id="daily-cap">0/100</span>
+            <span class="daily-stat-label">pts / cap</span>
+          </div>
+        </div>
+        <div class="daily-cap-bar-wrap">
+          <div class="daily-cap-bar">
+            <div class="daily-cap-fill" id="daily-cap-fill"></div>
+          </div>
+          <span class="daily-cap-text" id="daily-cap-text">0%</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Config Panel -->
     <div class="config-panel glass-panel">
       <div class="panel-header">
         <span>⚙️ Configuration</span>
@@ -93,17 +128,17 @@
               <span class="help-icon" data-tooltip="Cấp độ tài khoản Rewards của bạn (ảnh hưởng giới hạn điểm mỗi ngày)">?</span>
             </label>
             <select class="form-select" id="cfg-level">
-              <option value="member">Member (3)</option>
-              <option value="silver">Silver (6)</option>
-              <option value="gold" selected>Gold (12)</option>
+              <option value="member">Member (10 PC)</option>
+              <option value="silver">Silver (15 PC / 10 Mobile)</option>
+              <option value="gold" selected>Gold (30 PC / 20 Mobile)</option>
             </select>
           </div>
           <div class="form-group">
             <label class="form-label">
               PC Searches
-              <span class="help-icon" data-tooltip="Số lần tìm kiếm muốn chạy (thường Level 1 là 3, Level 2+ là 12)">?</span>
+              <span class="help-icon" data-tooltip="Số PC search mỗi ngày. Gold = max 30, Silver = 15, Member = 10">?</span>
             </label>
-            <input type="number" class="form-input" id="cfg-search" value="12" min="1" max="30">
+            <input type="number" class="form-input" id="cfg-search" value="30" min="1" max="30">
           </div>
         </div>
         <div class="speed-control">
@@ -123,13 +158,25 @@
             <span>5</span>
             <span>🚀 6</span>
           </div>
-          <div class="speed-detail" id="speed-detail">Delay 20-40s · Wave 4 · Pause 15p</div>
+          <div class="speed-detail" id="speed-detail">Delay 20-40s · Wave 5 · Pause 8p</div>
         </div>
         <div class="toggle-row">
           <div class="toggle-item">
             <span class="toggle-label">
-              📱 Mobile Tasks
-              <span class="help-icon" data-tooltip="Giả lập Edge trên điện thoại để hoàn thành tasks mobile">?</span>
+              📖 Click kết quả
+              <span class="help-icon" data-tooltip="Sau mỗi search, mở 1 link kết quả và đọc 5-12s. Simulate hành vi thật hơn.">?</span>
+            </span>
+            <label class="switch">
+              <input type="checkbox" id="cfg-read-result" checked>
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+        <div class="toggle-row">
+          <div class="toggle-item">
+            <span class="toggle-label">
+              📱 Mobile Search
+              <span class="help-icon" data-tooltip="Sau PC search, tự động chạy thêm Mobile search với UA giả lập">?</span>
             </span>
             <label class="switch">
               <input type="checkbox" id="cfg-mobile">
@@ -137,10 +184,13 @@
             </label>
           </div>
         </div>
-        <button class="btn btn-save" id="btn-save-config">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><polyline points="17,21 17,13 7,13 7,21" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><polyline points="7,3 7,8 15,8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          Save Config
-        </button>
+        <!-- Mobile count — only show when mobile is ON -->
+        <div class="mobile-count-row" id="mobile-count-row" style="display:none">
+          <div class="form-group">
+            <label class="form-label">📱 Mobile Searches <span class="help-icon" data-tooltip="Số lần mobile search sau PC. Gold max 20.">?</span></label>
+            <input type="number" class="form-input" id="cfg-mobile-count" value="20" min="1" max="20">
+          </div>
+        </div>
       </div>
     </div>
   </div>

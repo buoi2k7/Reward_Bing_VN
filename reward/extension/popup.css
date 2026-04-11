@@ -1066,3 +1066,129 @@ body.expanded .btn span {
     padding: var(--space-sm);
   }
 }
+
+/* ==========================
+   MAX MODE BUTTON
+   ========================== */
+.btn-max {
+  background: rgba(245, 158, 11, 0.12);
+  border-color: rgba(245, 158, 11, 0.35);
+  color: #f59e0b;
+}
+
+.btn-max:hover {
+  background: rgba(245, 158, 11, 0.22);
+  box-shadow: 0 0 16px rgba(245, 158, 11, 0.35);
+  color: #fbbf24;
+}
+
+.btn-max:active {
+  transform: scale(0.97);
+}
+
+/* ==========================
+   DAILY PROGRESS PANEL
+   ========================== */
+.daily-panel {
+  margin-bottom: var(--space-sm);
+}
+
+.daily-panel .panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.daily-body {
+  padding: var(--space-sm) var(--space-md) var(--space-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.daily-stats-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--space-sm);
+  text-align: center;
+}
+
+.daily-stat-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 4px;
+  background: var(--bg-inset);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-muted);
+}
+
+.daily-stat-value {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--color-primary);
+  line-height: 1;
+}
+
+.daily-stat-label {
+  font-size: 9px;
+  color: var(--text-muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.daily-cap-bar-wrap {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.daily-cap-bar {
+  flex: 1;
+  height: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.daily-cap-fill {
+  height: 100%;
+  border-radius: 4px;
+  background: linear-gradient(90deg, var(--color-primary), var(--color-secondary));
+  transition: width 0.6s var(--ease), background 0.4s ease;
+}
+
+.daily-cap-text {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  min-width: 40px;
+  text-align: right;
+}
+
+/* ==========================
+   AUTO-SAVE INDICATOR
+   ========================== */
+.auto-save-indicator {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--color-success);
+  font-family: var(--font-mono);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  pointer-events: none;
+}
+
+.auto-save-indicator.visible {
+  opacity: 1;
+}
+
+/* ==========================
+   MOBILE COUNT ROW
+   ========================== */
+.mobile-count-row {
+  animation: fadeInUp 0.25s var(--ease) both;
+}

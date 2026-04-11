@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <title>Bing Rewards Auto — Hoàn thành!</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #080c14;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      color: #e2e8f0;
+      overflow: hidden;
+    }
+
+    /* Animated background */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background:
+        radial-gradient(ellipse 70% 50% at 20% 40%, rgba(0, 229, 255, 0.07) 0%, transparent 60%),
+        radial-gradient(ellipse 60% 70% at 80% 60%, rgba(139, 92, 246, 0.06) 0%, transparent 60%),
+        radial-gradient(ellipse 50% 40% at 50% 10%, rgba(16, 185, 129, 0.05) 0%, transparent 70%);
+      animation: bgShift 10s ease-in-out infinite alternate;
+      z-index: 0;
+    }
+
+    @keyframes bgShift {
+      0%   { opacity: 0.7; transform: scale(1); }
+      100% { opacity: 1;   transform: scale(1.08); }
+    }
+
+    /* Grid lines */
+    body::after {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(0,229,255,0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0,229,255,0.03) 1px, transparent 1px);
+      background-size: 40px 40px;
+      z-index: 0;
+      pointer-events: none;
+    }
+
+    .particles {
+      position: fixed;
+      inset: 0;
+      z-index: 1;
+      pointer-events: none;
+    }
+
+    .container {
+      text-align: center;
+      animation: fadeInUp 0.8s cubic-bezier(0.4, 0, 0.2, 1);
+      position: relative;
+      z-index: 2;
+      max-width: 540px;
+      padding: 24px 20px;
+    }
+
+    /* Success icon */
+    .success-icon {
+      position: relative;
+      width: 120px;
+      height: 120px;
+      margin: 0 auto 28px;
+    }
+
+    .success-ring {
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      border: 3px solid transparent;
+      border-top-color: #00e5ff;
+      border-right-color: #7c3aed;
+      animation: spin 3s linear infinite;
+    }
+
+    .success-ring-inner {
+      position: absolute;
+      inset: 10px;
+      border-radius: 50%;
+      border: 2px solid transparent;
+      border-bottom-color: #10b981;
+      border-left-color: #f59e0b;
+      animation: spin 2s linear infinite reverse;
+    }
+
+    .success-circle {
+      position: absolute;
+      inset: 18px;
+      background: linear-gradient(135deg, #0e1628 0%, #162032 100%);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid rgba(0, 229, 255, 0.2);
+      box-shadow:
+        0 0 30px rgba(0, 229, 255, 0.15),
+        inset 0 0 20px rgba(0, 229, 255, 0.05);
+      animation: glowPulse 2s ease-in-out infinite alternate;
+    }
+
+    .success-circle span {
+      font-size: 2.2rem;
+      animation: checkPop 0.6s cubic-bezier(0.4, 0, 0.2, 1) 0.3s both;
+    }
+
+    @keyframes spin       { to { transform: rotate(360deg); } }
+    @keyframes glowPulse  {
+      0%   { box-shadow: 0 0 30px rgba(0,229,255,0.15), inset 0 0 20px rgba(0,229,255,0.05); }
+      100% { box-shadow: 0 0 50px rgba(0,229,255,0.3),  inset 0 0 30px rgba(0,229,255,0.1); }
+    }
+    @keyframes checkPop {
+      0%   { transform: scale(0) rotate(-30deg); opacity: 0; }
+      60%  { transform: scale(1.25) rotate(5deg); }
+      100% { transform: scale(1) rotate(0deg); opacity: 1; }
+    }
+
+    h1 {
+      font-size: 2.4rem;
+      font-weight: 900;
+      margin-bottom: 8px;
+      background: linear-gradient(135deg, #00e5ff 0%, #7c3aed 50%, #10b981 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      letter-spacing: -0.5px;
+    }
+
+    .subtitle {
+      font-size: 0.95rem;
+      color: #64748b;
+      margin-bottom: 32px;
+      line-height: 1.6;
+    }
+
+    /* Stats cards */
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      margin-bottom: 28px;
+    }
+
+    .stat {
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.07);
+      border-radius: 14px;
+      padding: 18px 10px;
+      transition: all 0.3s ease;
+      animation: statSlide 0.5s cubic-bezier(0.4,0,0.2,1) both;
+    }
+    .stat:nth-child(1) { animation-delay: 0.35s; }
+    .stat:nth-child(2) { animation-delay: 0.45s; }
+    .stat:nth-child(3) { animation-delay: 0.55s; }
+    .stat:hover {
+      background: rgba(0,229,255,0.05);
+      border-color: rgba(0,229,255,0.15);
+      transform: translateY(-3px);
+    }
+
+    @keyframes statSlide {
+      from { opacity: 0; transform: translateY(18px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .stat-emoji { font-size: 1.5rem; margin-bottom: 8px; display: block; }
+    .stat-value { font-size: 1.7rem; font-weight: 800; line-height: 1.1; }
+    .stat:nth-child(1) .stat-value { color: #00e5ff; }
+    .stat:nth-child(2) .stat-value { color: #10b981; }
+    .stat:nth-child(3) .stat-value { color: #f59e0b; }
+    .stat-label { font-size: 0.72rem; color: #475569; margin-top: 5px; font-weight: 500; letter-spacing: 0.3px; text-transform: uppercase; }
+
+    /* Extra row — earned points */
+    .earned-callout {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      background: rgba(16,185,129,0.06);
+      border: 1px solid rgba(16,185,129,0.12);
+      border-radius: 12px;
+      padding: 14px 18px;
+      margin-bottom: 20px;
+      text-align: left;
+      animation: fadeInUp 0.6s cubic-bezier(0.4,0,0.2,1) 0.65s both;
+    }
+    .earned-callout .reward-emoji { font-size: 2rem; flex-shrink: 0; }
+    .earned-callout .reward-text { font-size: 0.87rem; color: #94a3b8; line-height: 1.5; }
+    .earned-callout .reward-text strong { color: #10b981; }
+
+    /* Time profile badge */
+    .time-badge {
+      display: inline-block;
+      background: rgba(0,229,255,0.08);
+      border: 1px solid rgba(0,229,255,0.15);
+      border-radius: 20px;
+      padding: 3px 12px;
+      font-size: 0.75rem;
+      color: #00e5ff;
+      margin-bottom: 28px;
+      animation: fadeInUp 0.5s ease 0.7s both;
+    }
+
+    /* Action buttons */
+    .actions {
+      display: flex;
+      gap: 10px;
+      justify-content: center;
+      animation: fadeInUp 0.6s cubic-bezier(0.4,0,0.2,1) 0.75s both;
+    }
+
+    .btn {
+      padding: 12px 24px;
+      border-radius: 10px;
+      border: none;
+      font-size: 0.9rem;
+      font-weight: 600;
+      font-family: 'Inter', sans-serif;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #00b4d8, #7c3aed);
+      color: white;
+      box-shadow: 0 4px 15px rgba(0,229,255,0.2);
+      position: relative;
+      overflow: hidden;
+    }
+    .btn-primary::after {
+      content: '';
+      position: absolute;
+      top: 0; left: -100%;
+      width: 100%; height: 100%;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.12), transparent);
+      transition: 0.5s;
+    }
+    .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(0,229,255,0.3); }
+    .btn-primary:hover::after { left: 100%; }
+
+    .btn-secondary {
+      background: rgba(255,255,255,0.05);
+      color: #94a3b8;
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+    .btn-secondary:hover { background: rgba(255,255,255,0.09); color: #e2e8f0; transform: translateY(-2px); }
+
+    @keyframes fadeInUp {
+      from { opacity: 0; transform: translateY(22px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    /* Particle */
+    .particle {
+      position: absolute;
+      border-radius: 50%;
+      animation: floatUp linear infinite;
+      opacity: 0;
+    }
+    @keyframes floatUp {
+      0%   { transform: translateY(100vh) scale(0); opacity: 0; }
+      10%  { opacity: 0.5; }
+      90%  { opacity: 0.4; }
+      100% { transform: translateY(-10vh) scale(1); opacity: 0; }
+    }
+
+    .footer {
+      position: fixed;
+      bottom: 0; left: 0; right: 0;
+      padding: 10px;
+      text-align: center;
+      font-size: 0.68rem;
+      color: #1e293b;
+      z-index: 2;
+    }
+    .footer a { color: #334155; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="particles" id="particles"></div>
+
+  <div class="container">
+    <div class="success-icon">
+      <div class="success-ring"></div>
+      <div class="success-ring-inner"></div>
+      <div class="success-circle"><span>🎯</span></div>
+    </div>
+
+    <h1>Hoàn thành!</h1>
+    <p class="subtitle">Tất cả lượt tìm kiếm đã thực hiện.<br>Điểm sẽ cập nhật trong 1–2 phút.</p>
+
+    <div class="stats">
+      <div class="stat">
+        <span class="stat-emoji">🔍</span>
+        <div class="stat-value" id="val-searches">—</div>
+        <div class="stat-label">Lượt search</div>
+      </div>
+      <div class="stat">
+        <span class="stat-emoji">⭐</span>
+        <div class="stat-value" id="val-points">—</div>
+        <div class="stat-label">Điểm kiếm được</div>
+      </div>
+      <div class="stat">
+        <span class="stat-emoji">⏱</span>
+        <div class="stat-value" id="val-duration">—</div>
+        <div class="stat-label">Thời gian</div>
+      </div>
+    </div>
+
+    <div class="earned-callout">
+      <span class="reward-emoji">🏆</span>
+      <div class="reward-text">
+        Kiểm tra <strong>Microsoft Rewards</strong> để xem điểm cập nhật.
+        Chế độ: <strong id="val-mode">—</strong>
+      </div>
+    </div>
+
+    <div class="time-badge" id="val-time-profile">🕐 —</div>
+
+    <div class="actions">
+      <a href="https://rewards.bing.com/" target="_blank" class="btn btn-primary">
+        🏆 Xem Rewards
+      </a>
+      <button class="btn btn-secondary" id="btn-close">✕ Đóng</button>
+    </div>
+  </div>
+
+  <div class="footer">Bing Rewards Auto v2.2.0</div>
+
+  <script>
+    // Parse URL params
+    const params = new URLSearchParams(location.search);
+    const searches  = parseInt(params.get('searches')) || 0;
+    const earned    = parseInt(params.get('earned'))   || 0;
+    const duration  = parseInt(params.get('duration')) || 0;
+    const mode      = params.get('mode') || 'desktop';
+    const timePrf   = params.get('timeProfile') || '';
+
+    // Fill values
+    document.getElementById('val-searches').textContent  = searches || '—';
+    document.getElementById('val-points').textContent    = earned > 0 ? `+${earned}` : '—';
+    document.getElementById('val-duration').textContent  = duration > 60
+      ? `${Math.floor(duration/60)}m ${duration%60}s`
+      : `${duration}s`;
+
+    const modeMap = { desktop: 'PC', mobile: 'Mobile', both: 'PC + Mobile' };
+    document.getElementById('val-mode').textContent = modeMap[mode] || mode;
+
+    const timeMap = {
+      morning: '🌅 Buổi sáng (chậm)',
+      afternoon: '☀️ Buổi chiều (bình thường)',
+      evening: '🌆 Buổi tối (nhanh hơn)',
+      night: '🌙 Ban đêm (rất chậm)'
+    };
+    const tpEl = document.getElementById('val-time-profile');
+    if (timePrf && timeMap[timePrf]) {
+      tpEl.textContent = timeMap[timePrf];
+    } else {
+      tpEl.style.display = 'none';
+    }
+
+    // Close button
+    document.getElementById('btn-close').addEventListener('click', () => window.close());
+
+    // Particles
+    const pContainer = document.getElementById('particles');
+    const colors = ['#00e5ff', '#7c3aed', '#10b981', '#f59e0b', '#ec4899'];
+    for (let i = 0; i < 18; i++) {
+      const p = document.createElement('div');
+      p.className = 'particle';
+      const size = Math.random() * 4 + 2;
+      p.style.cssText = `
+        width:${size}px; height:${size}px;
+        left:${Math.random()*100}%;
+        background:${colors[Math.floor(Math.random()*colors.length)]};
+        animation-duration:${6 + Math.random()*8}s;
+        animation-delay:${Math.random()*5}s;
+      `;
+      pContainer.appendChild(p);
+    }
+  </script>
+</body>
+</html>
