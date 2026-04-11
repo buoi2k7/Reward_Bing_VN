@@ -1,9 +1,0 @@
-sessions/
-dist/
-node_modules/
-notes
-.DS_Store
-# Temporary and log files
-*.log
-*.tmp
-.env

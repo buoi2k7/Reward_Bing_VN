@@ -1,6 +1,0 @@
-.agent/
-.claude/
-.gemini/
-*.log
-tmp/
-node_modules/
