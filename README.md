@@ -73,7 +73,7 @@
 ## 📁 File Structure
 
 ```
-reward/extension/
+extension/
 ├── manifest.json                  # Extension manifest v3
 ├── background.js                  # Service worker — core logic & orchestrator
 ├── popup.html                     # Extension popup UI
@@ -113,12 +113,12 @@ git clone https://github.com/buoi2k7/Reward_Bing_VN.git
 
 1. Mở Chrome → `chrome://extensions/`
 2. Bật **Developer mode** (góc phải trên)
-3. Click **"Load unpacked"** → chọn thư mục `reward/extension/`
+3. Click **"Load unpacked"** → chọn thư mục `extension/`
 4. Đăng nhập [rewards.bing.com](https://rewards.bing.com) trên trình duyệt
 
 ### Cách 2: Từ file ZIP
 
-1. Download file `extension.zip` hoặc `extension-latest.zip` từ repo
+1. Download file ZIP từ [Releases](https://github.com/buoi2k7/Reward_Bing_VN/releases)
 2. Giải nén ra thư mục
 3. Load unpacked như trên
 
