@@ -1,29 +1,30 @@
 {
   "manifest_version": 3,
   "name": "Bing Rewards Auto",
-  "version": "2.2.0",
-  "description": "Auto Search — Time Profile, Coffee Break, Tab Switch, Full Mobile Fingerprint, Done Page",
+  "version": "4.1.0",
+  "description": "Microsoft Rewards search automation with direct search counts",
   "permissions": [
-    "tabs",
-    "scripting",
     "storage",
-    "activeTab",
     "alarms",
+    "tabs",
+    "activeTab",
+    "scripting",
     "declarativeNetRequest",
-    "declarativeNetRequestWithHostAccess"
+    "declarativeNetRequestWithHostAccess",
+    "browsingData",
+    "contextMenus"
   ],
   "host_permissions": [
     "https://www.bing.com/*",
+    "https://bing.com/*",
     "https://rewards.bing.com/*",
-    "https://*.bing.com/*"
+    "https://rewards.microsoft.com/*",
+    "https://account.microsoft.com/*"
   ],
-  "icons": {
-    "16": "icons/icon-16.png",
-    "48": "icons/icon-48.png",
-    "128": "icons/icon-128.png"
+  "background": {
+    "service_worker": "background.js"
   },
   "action": {
-    "default_title": "Rewards Auto",
     "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon-16.png",
@@ -31,18 +32,43 @@
       "128": "icons/icon-128.png"
     }
   },
-  "background": {
-    "service_worker": "background.js"
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
   },
   "declarative_net_request": {
-    "rule_resources": [{
-      "id": "mobile_ua_rules",
-      "enabled": false,
-      "path": "rules_mobile_ua.json"
-    }]
+    "rule_resources": [
+      {
+        "id": "mobile_ua_rules",
+        "enabled": false,
+        "path": "rules_mobile_ua.json"
+      }
+    ]
   },
-  "web_accessible_resources": [{
-    "resources": ["done.html", "mobile-override.js"],
-    "matches": ["<all_urls>"]
-  }]
+  "content_scripts": [
+    {
+      "matches": [
+        "https://rewards.bing.com/*",
+        "https://rewards.microsoft.com/*"
+      ],
+      "js": ["content-intercept.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://rewards.bing.com/*",
+        "https://rewards.microsoft.com/*"
+      ],
+      "js": ["content-intercept-bridge.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["extract.html", "ms-data-extract.js", "content-intercept.js"],
+      "matches": ["https://rewards.bing.com/*", "https://rewards.microsoft.com/*", "https://www.bing.com/*"]
+    }
+  ]
 }

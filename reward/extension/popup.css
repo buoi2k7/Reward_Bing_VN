@@ -110,6 +110,15 @@ body.expanded {
   max-height: 640px;
 }
 
+body.detached {
+  width: 380px;
+  min-height: 480px;
+}
+
+body.detached.expanded {
+  width: 720px;
+}
+
 /* Animated gradient mesh background */
 body::before {
   content: '';
@@ -163,6 +172,24 @@ body::before {
   border-bottom: 1px solid var(--border-default);
   position: relative;
   z-index: 10;
+}
+
+body.detached .header {
+  cursor: move;
+  user-select: none;
+}
+
+body.detached .header button,
+body.detached .header .points-display {
+  cursor: default;
+}
+
+body.detached .header button {
+  cursor: pointer;
+}
+
+body.detached.dragging {
+  user-select: none;
 }
 
 /* Neon flow line */
@@ -318,6 +345,13 @@ body::before {
   align-items: center;
 }
 
+.status-side {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-sm);
+  min-width: 0;
+}
+
 .status-badge {
   display: flex;
   align-items: center;
@@ -350,16 +384,6 @@ body::before {
 
 .status-badge.running {
   color: var(--color-primary);
-}
-
-.status-badge.cooldown .status-dot {
-  background: var(--color-warning);
-  box-shadow: 0 0 8px var(--color-warning);
-  animation: dotPulse 2s infinite;
-}
-
-.status-badge.cooldown {
-  color: var(--color-warning);
 }
 
 .status-badge.done .status-dot {
@@ -402,9 +426,54 @@ body::before {
   }
 }
 
-.wave-info {
+.phase-info {
   font-size: 11px;
   font-family: var(--font-mono);
+  color: var(--text-muted);
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ban-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-default);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  white-space: nowrap;
+}
+
+.ban-chip.ok {
+  border-color: rgba(16, 185, 129, 0.45);
+  background: rgba(16, 185, 129, 0.14);
+  color: #34d399;
+}
+
+.ban-chip.warn {
+  border-color: rgba(245, 158, 11, 0.48);
+  background: rgba(245, 158, 11, 0.14);
+  color: #fbbf24;
+}
+
+.ban-chip.ban {
+  border-color: rgba(239, 68, 68, 0.48);
+  background: rgba(239, 68, 68, 0.14);
+  color: #f87171;
+}
+
+.ban-chip.unknown {
+  border-color: rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
   color: var(--text-muted);
 }
 
@@ -483,6 +552,28 @@ body::before {
   gap: var(--space-sm);
 }
 
+/* Primary row: Search, Max, Stop — more prominent */
+.controls-primary {
+  gap: 10px;
+}
+
+/* Secondary row: smaller, more subtle */
+.controls-secondary {
+  gap: 6px;
+}
+
+.controls-secondary .btn {
+  padding: 7px 8px;
+  font-size: 10px;
+  letter-spacing: 0.4px;
+  opacity: 0.85;
+  transition: all var(--duration) var(--ease);
+}
+
+.controls-secondary .btn:hover {
+  opacity: 1;
+}
+
 .btn {
   flex: 1;
   display: flex;
@@ -513,16 +604,58 @@ body::before {
   transform: translateY(0);
 }
 
+/* Large button variant for Search */
+.btn-lg {
+  flex: 1.5;
+  padding: 11px 16px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  gap: 8px;
+}
+
 /* Button Variants */
 .btn-primary {
   background: var(--color-primary-subtle);
   border-color: var(--color-primary-border);
   color: var(--color-primary);
+  position: relative;
+  overflow: hidden;
+}
+
+.btn-primary::before {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  background: linear-gradient(135deg, rgba(0, 229, 255, 0.12), rgba(139, 92, 246, 0.08));
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  pointer-events: none;
 }
 
 .btn-primary:hover {
   background: rgba(0, 229, 255, 0.2);
-  box-shadow: var(--color-primary-glow);
+  box-shadow: var(--color-primary-glow), inset 0 0 20px rgba(0, 229, 255, 0.08);
+}
+
+.btn-primary:hover::before {
+  opacity: 1;
+}
+
+/* Search button idle pulse — subtle heartbeat glow */
+.btn-primary.btn-lg:not(:disabled) {
+  animation: searchBtnPulse 3s ease-in-out infinite;
+}
+
+.btn-primary.btn-lg:hover {
+  animation: none;
+  box-shadow: 0 0 24px rgba(0, 229, 255, 0.5), inset 0 0 20px rgba(0, 229, 255, 0.08);
+}
+
+@keyframes searchBtnPulse {
+  0%, 100% { box-shadow: 0 0 8px rgba(0, 229, 255, 0.15); }
+  50% { box-shadow: 0 0 18px rgba(0, 229, 255, 0.3); }
 }
 
 .btn-danger {
@@ -536,17 +669,6 @@ body::before {
   box-shadow: 0 0 16px rgba(239, 68, 68, 0.3);
 }
 
-.btn-accent {
-  background: var(--color-accent-subtle);
-  border-color: var(--color-accent-border);
-  color: var(--color-accent);
-}
-
-.btn-accent:hover {
-  background: rgba(167, 139, 250, 0.2);
-  box-shadow: 0 0 16px rgba(167, 139, 250, 0.3);
-}
-
 .btn-ghost {
   background: transparent;
   border-color: var(--border-default);
@@ -557,6 +679,44 @@ body::before {
   background: rgba(255, 255, 255, 0.04);
   border-color: rgba(255, 255, 255, 0.12);
   color: var(--text-primary);
+}
+
+/* Disabled state for all buttons */
+.btn:disabled,
+.btn[disabled] {
+  opacity: 0.4 !important;
+  cursor: not-allowed;
+  pointer-events: none;
+  animation: none !important;
+  box-shadow: none !important;
+  transform: none !important;
+}
+
+/* Clear Data button — amber/warning style */
+.btn-clear-data {
+  background: rgba(245, 158, 11, 0.08);
+  border-color: rgba(245, 158, 11, 0.25);
+  color: #f59e0b;
+}
+
+.btn-clear-data:hover {
+  background: rgba(245, 158, 11, 0.18);
+  border-color: rgba(245, 158, 11, 0.4);
+  box-shadow: 0 0 14px rgba(245, 158, 11, 0.2);
+  color: #fbbf24;
+}
+
+.btn-check-ban {
+  background: rgba(139, 92, 246, 0.08);
+  border-color: rgba(139, 92, 246, 0.28);
+  color: #a78bfa;
+}
+
+.btn-check-ban:hover {
+  background: rgba(139, 92, 246, 0.18);
+  border-color: rgba(139, 92, 246, 0.42);
+  box-shadow: 0 0 14px rgba(139, 92, 246, 0.22);
+  color: #c4b5fd;
 }
 
 .btn-save {
@@ -898,6 +1058,15 @@ body.expanded .config-row {
   box-shadow: 0 0 8px rgba(255, 255, 255, 0.5);
 }
 
+.popup-workspace {
+  display: block;
+}
+
+.main-column,
+.side-column {
+  min-width: 0;
+}
+
 /* ==========================
    LOG TERMINAL
    ========================== */
@@ -993,7 +1162,8 @@ body.expanded .log-window {
   color: var(--color-success);
 }
 
-.log-entry.warning {
+.log-entry.warning,
+.log-entry.warn {
   color: var(--color-warning);
 }
 
@@ -1007,6 +1177,39 @@ body.expanded .log-window {
 body.expanded {
   display: flex;
   flex-direction: column;
+}
+
+body.expanded .popup-workspace {
+  display: grid;
+  grid-template-columns: 1fr 1.15fr;
+  gap: var(--space-md);
+  margin: 0 var(--space-lg) var(--space-lg);
+  align-items: start;
+}
+
+body.expanded .main-column,
+body.expanded .side-column {
+  display: flex;
+  flex-direction: column;
+}
+
+body.expanded .controls {
+  margin: var(--space-sm) 0;
+}
+
+body.expanded .expanded-section {
+  margin: 0;
+  margin-top: var(--space-sm);
+}
+
+body.expanded .log-section {
+  margin: var(--space-sm) 0 0;
+  height: 100%;
+}
+
+body.expanded .log-window {
+  min-height: 360px;
+  max-height: none;
 }
 
 body.expanded .controls-row {
@@ -1068,25 +1271,6 @@ body.expanded .btn span {
 }
 
 /* ==========================
-   MAX MODE BUTTON
-   ========================== */
-.btn-max {
-  background: rgba(245, 158, 11, 0.12);
-  border-color: rgba(245, 158, 11, 0.35);
-  color: #f59e0b;
-}
-
-.btn-max:hover {
-  background: rgba(245, 158, 11, 0.22);
-  box-shadow: 0 0 16px rgba(245, 158, 11, 0.35);
-  color: #fbbf24;
-}
-
-.btn-max:active {
-  transform: scale(0.97);
-}
-
-/* ==========================
    DAILY PROGRESS PANEL
    ========================== */
 .daily-panel {
@@ -1137,36 +1321,6 @@ body.expanded .btn span {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.5px;
-}
-
-.daily-cap-bar-wrap {
-  display: flex;
-  align-items: center;
-  gap: var(--space-sm);
-}
-
-.daily-cap-bar {
-  flex: 1;
-  height: 8px;
-  background: rgba(255, 255, 255, 0.06);
-  border-radius: 4px;
-  overflow: hidden;
-}
-
-.daily-cap-fill {
-  height: 100%;
-  border-radius: 4px;
-  background: linear-gradient(90deg, var(--color-primary), var(--color-secondary));
-  transition: width 0.6s var(--ease), background 0.4s ease;
-}
-
-.daily-cap-text {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--text-secondary);
-  min-width: 40px;
-  text-align: right;
 }
 
 /* ==========================

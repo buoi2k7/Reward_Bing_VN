@@ -1,0 +1,23 @@
+{
+  "timestamp": "2026-05-26T03:08:54.286Z",
+  "scraped": {
+    "earnTab": "Dashboard",
+    "pointBreakdown": [
+      "Points breakdown",
+      "Learn more",
+      "Learn more"
+    ],
+    "todayActivity": [
+      "Today's activity | Points | Desktop Bing search | 0/90 | Mobile Bing search | 0/60 | Offers | 0",
+      "History | Points | This month | 248 | This year | 5,629 | Lifetime | 23,882"
+    ],
+    "pointActivityHeaders": [
+      "Today's activityPoints"
+    ],
+    "desktopSearch": [
+      "Desktop Bing search"
+    ],
+    "mobileSearch": "Today's activity | Points | Desktop Bing search | 0/90 | Mobile Bing search | 0/60 | Offers | 0",
+    "offers": "Today's activity | Points | Desktop Bing search | 0/90 | Mobile Bing search | 0/60 | Offers | 0"
+  }
+}

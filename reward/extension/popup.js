@@ -1,39 +1,43 @@
 // =============================================
 // BING REWARDS AUTO - POPUP UI CONTROLLER
-// Handles compact/expanded toggle, commands,
-// and real-time state updates from background.js
+// Compact controller for direct-count search runs.
 // =============================================
 
-// ---- DOM ELEMENTS ----
 const $ = (sel) => document.querySelector(sel);
-const $$ = (sel) => document.querySelectorAll(sel);
+const isDetachedWindow = new URLSearchParams(location.search).get('detached') === '1';
+
+if (isDetachedWindow) {
+  document.body.classList.add('detached');
+}
+
+const SPEED_PRESETS = {
+  1: { name: 'Chậm',      minDelay: 35, maxDelay: 55, color: '#10b981' },
+  2: { name: 'Êm',        minDelay: 24, maxDelay: 36, color: '#34d399' },
+  3: { name: 'Vừa',       minDelay: 14, maxDelay: 24, color: '#00e5ff' },
+  4: { name: 'Nhanh',     minDelay: 8,  maxDelay: 14, color: '#f59e0b' },
+  5: { name: 'Rất nhanh', minDelay: 5,  maxDelay: 9,  color: '#ef4444' },
+  6: { name: 'Tối đa',    minDelay: 3,  maxDelay: 6,  color: '#dc2626' }
+};
 
 const DOM = {
-  // Header
   pointsValue: $('#points-value'),
   pointsEarned: $('#points-earned'),
   btnToggleSize: $('#btn-toggle-size'),
-  
-  // Status
   statusBadge: $('#status-badge'),
-  statusDot: $('#status-dot'),
   statusText: $('#status-text'),
-  waveInfo: $('#wave-info'),
+  phaseInfo: $('#phase-info'),
+  banChip: $('#ban-chip'),
   progressBar: $('#progress-bar'),
   progressText: $('#progress-text'),
-  
-  // Buttons
   btnSearch: $('#btn-search'),
   btnStop: $('#btn-stop'),
-  btnMaxMode: $('#btn-max-mode'),
-  btnTasks: $('#btn-tasks'),
   btnPoints: $('#btn-points'),
+  btnCheckBan: $('#btn-check-ban'),
   btnResetPage: $('#btn-reset-page'),
   btnResetProgress: $('#btn-reset-progress'),
+  btnClearData: $('#btn-clear-data'),
   btnClearLogs: $('#btn-clear-logs'),
-  
-  // Config
-  cfgLevel: $('#cfg-level'),
+  btnDetachWindow: $('#btn-detach-window'),
   cfgSearch: $('#cfg-search'),
   cfgSpeed: $('#cfg-speed'),
   speedBadge: $('#speed-badge'),
@@ -43,69 +47,113 @@ const DOM = {
   cfgReadResult: $('#cfg-read-result'),
   mobileCountRow: $('#mobile-count-row'),
   autoSaveIndicator: $('#auto-save-indicator'),
-
-  // Daily Progress
   dailyEarned: $('#daily-earned'),
   dailySearches: $('#daily-searches'),
-  dailyCap: $('#daily-cap'),
-  dailyCapFill: $('#daily-cap-fill'),
-  dailyCapText: $('#daily-cap-text'),
-
-  // Sections
-  expandedSection: $('#expanded-section'),
+  dailySplit: $('#daily-split'),
   logWindow: $('#log-window')
 };
 
-// ---- SIZE TOGGLE ----
 let isExpanded = false;
+let autoSaveTimer = null;
 
-// Load saved size preference
 chrome.storage.local.get('uiExpanded', (result) => {
-  if (result.uiExpanded) {
-    isExpanded = true;
-    document.body.classList.replace('compact', 'expanded');
-  }
+  if (!result.uiExpanded) return;
+  isExpanded = true;
+  document.body.classList.replace('compact', 'expanded');
 });
 
-DOM.btnToggleSize.addEventListener('click', () => {
+DOM.btnToggleSize?.addEventListener('click', () => {
   isExpanded = !isExpanded;
-  if (isExpanded) {
-    document.body.classList.replace('compact', 'expanded');
-  } else {
-    document.body.classList.replace('expanded', 'compact');
-  }
+  document.body.classList.toggle('expanded', isExpanded);
+  document.body.classList.toggle('compact', !isExpanded);
   chrome.storage.local.set({ uiExpanded: isExpanded });
+  resizeDetachedWindow();
 });
 
-// ---- INIT: Load state & config ----
-async function init() {
-  try {
-    // Get current state
-    const response = await chrome.runtime.sendMessage({ action: 'get_state' });
-    if (response?.state) updateUI(response.state);
-    if (response?.logs) {
-      DOM.logWindow.innerHTML = '';
-      response.logs.forEach(entry => addLogEntry(entry));
-    }
-    
-    // Get config
-    const configResponse = await chrome.runtime.sendMessage({ action: 'get_config' });
-    if (configResponse?.config) loadConfig(configResponse.config);
-    
-  } catch (e) {
-    addLogEntry({ text: '⚡ Extension ready', type: 'info', time: new Date().toLocaleTimeString() });
-  }
+DOM.btnDetachWindow?.addEventListener('click', async () => {
+  await chrome.runtime.sendMessage({ action: 'command', command: 'open_control_window' });
+  window.close();
+});
+
+if (DOM.btnDetachWindow) {
+  DOM.btnDetachWindow.style.display = isDetachedWindow ? 'none' : '';
 }
 
-// ---- UI UPDATE ----
-function updateUI(state) {
-  // Points — show '---' if never checked, real number otherwise
-  const pts = state.points?.current;
-  DOM.pointsValue.textContent = (pts !== null && pts !== undefined)
-    ? pts.toLocaleString()
-    : '---';
+async function resizeDetachedWindow() {
+  if (!isDetachedWindow || !chrome.windows) return;
+  try {
+    const win = await chrome.windows.getCurrent();
+    await chrome.windows.update(win.id, {
+      width: isExpanded ? 720 : 380,
+      height: isExpanded ? 640 : 600
+    });
+  } catch (e) {}
+}
 
-  // Earned badge — only show if we have real data
+async function saveDetachedBounds() {
+  if (!isDetachedWindow || !chrome.windows) return;
+  try {
+    const win = await chrome.windows.getCurrent();
+    await chrome.storage.local.set({
+      controlWindowBounds: {
+        left: win.left,
+        top: win.top,
+        width: win.width,
+        height: win.height
+      }
+    });
+  } catch (e) {}
+}
+
+function initDetachedDrag() {
+  if (!isDetachedWindow || !chrome.windows) return;
+  const header = $('#header');
+  if (!header) return;
+
+  let dragging = false;
+  let startX = 0;
+  let startY = 0;
+  let startLeft = 0;
+  let startTop = 0;
+  let windowId = null;
+
+  header.addEventListener('mousedown', async (event) => {
+    if (event.button !== 0 || event.target.closest('button, input, select, a')) return;
+    try {
+      const win = await chrome.windows.getCurrent();
+      windowId = win.id;
+      startX = event.screenX;
+      startY = event.screenY;
+      startLeft = win.left || 0;
+      startTop = win.top || 0;
+      dragging = true;
+      document.body.classList.add('dragging');
+      event.preventDefault();
+    } catch (e) {}
+  });
+
+  window.addEventListener('mousemove', (event) => {
+    if (!dragging || windowId === null) return;
+    chrome.windows.update(windowId, {
+      left: Math.round(startLeft + event.screenX - startX),
+      top: Math.round(startTop + event.screenY - startY)
+    });
+  });
+
+  window.addEventListener('mouseup', async () => {
+    if (!dragging) return;
+    dragging = false;
+    document.body.classList.remove('dragging');
+    await saveDetachedBounds();
+  });
+
+  window.addEventListener('beforeunload', saveDetachedBounds);
+}
+
+function updateUI(state) {
+  const pts = state.points?.current;
+  DOM.pointsValue.textContent = pts !== null && pts !== undefined ? pts.toLocaleString() : '---';
+
   const earned = state.points?.earned;
   if (earned !== null && earned !== undefined && earned !== 0) {
     DOM.pointsEarned.textContent = `${earned > 0 ? '+' : ''}${earned}`;
@@ -117,94 +165,72 @@ function updateUI(state) {
     DOM.pointsEarned.textContent = '';
     DOM.pointsEarned.style.color = '';
   }
-  
-  // Status badge
+
   const status = state.status || 'idle';
   DOM.statusBadge.className = `status-badge ${status}`;
-  
-  const statusLabels = {
+  DOM.statusText.textContent = ({
     idle: 'Idle',
     running: 'Running',
-    cooldown: 'Wave Pause',
     stopped: 'Stopped',
     done: 'Completed',
     error: 'Error'
-  };
-  DOM.statusText.textContent = statusLabels[status] || status;
-  
-  // Wave info
-  if (state.wave?.current > 0 && state.wave?.total > 0) {
-    DOM.waveInfo.textContent = `Wave ${state.wave.current}/${state.wave.total}`;
-  } else {
-    DOM.waveInfo.textContent = '';
-  }
-  
-  // Progress
+  })[status] || status;
+
+  const phase = state.phase === 'mobile' ? 'Mobile' : 'PC';
+  DOM.phaseInfo.textContent = status === 'running'
+    ? `${phase}${state.currentQuery ? ` · ${state.currentQuery}` : ''}`
+    : '';
+
   DOM.progressBar.style.width = `${state.percent || 0}%`;
   DOM.progressText.textContent = state.progress || '0/0';
-  
-  // Button states
-  const isRunning = status === 'running' || status === 'cooldown';
-  DOM.btnSearch.disabled = isRunning;
-  DOM.btnTasks.disabled = isRunning;
-  DOM.btnSearch.style.opacity = isRunning ? '0.5' : '1';
-  DOM.btnTasks.style.opacity = isRunning ? '0.5' : '1';
+
+  const running = status === 'running';
+  DOM.btnSearch.disabled = running;
+  DOM.btnCheckBan.disabled = running;
+  DOM.btnStop.disabled = !running;
 }
 
-// ---- SPEED LEVELS ----
-const SPEED_LEVELS = {
-  1: { name: 'Siêu an toàn',  minDelay: 50, maxDelay: 90,  waveSize: 2, wavePause: 20, color: '#10b981' },
-  2: { name: 'An toàn',       minDelay: 35, maxDelay: 60,  waveSize: 3, wavePause: 12, color: '#34d399' },
-  3: { name: 'Bình thường',   minDelay: 20, maxDelay: 40,  waveSize: 5, wavePause: 8,  color: '#00e5ff' },
-  4: { name: 'Nhanh',         minDelay: 12, maxDelay: 25,  waveSize: 6, wavePause: 4,  color: '#f59e0b' },
-  5: { name: 'Rất nhanh',     minDelay: 8,  maxDelay: 15,  waveSize: 7, wavePause: 3,  color: '#ef4444' },
-  6: { name: 'Tốc biến ⚠️',   minDelay: 5,  maxDelay: 10,  waveSize: 8, wavePause: 2,  color: '#dc2626' }
-};
+function renderBanStatus(banState) {
+  if (!DOM.banChip) return;
 
-// Daily point caps by tier (must match background.js TIER_LIMITS)
-const TIER_CAPS = {
-  member: { pcSearch: 10,  mobileSearch: 0,  dailyPointCap: 15  },
-  silver: { pcSearch: 15,  mobileSearch: 10, dailyPointCap: 30  },
-  gold:   { pcSearch: 30,  mobileSearch: 20, dailyPointCap: 100 }
-};
+  const status = (banState?.status || 'UNKNOWN').toUpperCase();
+  const className = {
+    OK: 'ok',
+    WARN: 'warn',
+    BAN: 'ban',
+    UNKNOWN: 'unknown'
+  }[status] || 'unknown';
+
+  const label = {
+    OK: 'BAN: OK',
+    WARN: 'BAN: WARN',
+    BAN: 'BAN: DETECT',
+    UNKNOWN: 'BAN: --'
+  }[status] || `BAN: ${status}`;
+
+  const reasons = Array.isArray(banState?.reasons) ? banState.reasons : [];
+  const updatedAt = banState?.updatedAt ? new Date(banState.updatedAt).toLocaleString() : '';
+
+  DOM.banChip.className = `ban-chip ${className}`;
+  DOM.banChip.textContent = label;
+  DOM.banChip.title = reasons.length
+    ? `${label}\n${reasons.slice(0, 3).join(' | ')}${updatedAt ? `\nUpdated: ${updatedAt}` : ''}`
+    : `${label}${updatedAt ? `\nUpdated: ${updatedAt}` : ''}`;
+}
 
 function updateSpeedDisplay(level) {
-  const s = SPEED_LEVELS[level];
-  if (!s) return;
-  DOM.speedBadge.textContent = `Lv.${level} — ${s.name}`;
-  DOM.speedBadge.style.color = s.color;
-  DOM.speedDetail.textContent = `Delay ${s.minDelay}-${s.maxDelay}s · Wave ${s.waveSize} · Pause ${s.wavePause}p`;
+  const preset = SPEED_PRESETS[level] || SPEED_PRESETS[3];
+  DOM.speedBadge.textContent = preset.name;
+  DOM.speedBadge.style.color = preset.color;
+  DOM.speedDetail.textContent = `Delay ${preset.minDelay}-${preset.maxDelay}s · Không wave pause`;
 }
-
-// Live slider preview
-DOM.cfgSpeed.addEventListener('input', () => {
-  updateSpeedDisplay(parseInt(DOM.cfgSpeed.value));
-  scheduleAutoSave();
-});
-
-// ---- DAILY PROGRESS ----
-let currentDailyCap = 100;
 
 function updateDailyProgressUI(dp) {
   if (!dp) return;
-  const tier = DOM.cfgLevel?.value || 'gold';
-  currentDailyCap = TIER_CAPS[tier]?.dailyPointCap || 100;
-
-  const earned = dp.earnedToday || 0;
-  const searches = dp.searchesDone || 0;
-  const pct = Math.min(100, Math.round((earned / currentDailyCap) * 100));
-
-  DOM.dailyEarned.textContent = `+${earned} pts`;
-  DOM.dailyEarned.style.color = earned > 0 ? '#10b981' : 'var(--text-secondary)';
-  DOM.dailySearches.textContent = `~${searches} lần`;
-  DOM.dailyCap.textContent = `${earned}/${currentDailyCap}`;
-  DOM.dailyCapFill.style.width = `${pct}%`;
-  DOM.dailyCapFill.style.background = pct >= 100
-    ? 'linear-gradient(90deg, #10b981, #34d399)'
-    : pct >= 75
-      ? 'linear-gradient(90deg, #f59e0b, #fbbf24)'
-      : 'linear-gradient(90deg, var(--color-primary), var(--color-secondary))';
-  DOM.dailyCapText.textContent = `${pct}%${pct >= 100 ? ' ✅' : ''}`;
+  DOM.dailyEarned.textContent = `+${dp.earnedToday || 0} pts`;
+  DOM.dailyEarned.style.color = dp.earnedToday > 0 ? '#10b981' : 'var(--text-secondary)';
+  DOM.dailySearches.textContent = `~${dp.searchesDone || 0} lần`;
+  DOM.dailySplit.textContent = `${dp.pcDone || 0}/${dp.mobileDone || 0}`;
 }
 
 async function loadDailyProgress() {
@@ -214,124 +240,53 @@ async function loadDailyProgress() {
   } catch (e) {}
 }
 
-// ---- TIER SYNC HELPERS ----
-// Cập nhật max attr + giá trị search count theo tier
-function syncSearchCountToTier(tierKey) {
-  const tier = TIER_CAPS[tierKey];
-  if (!tier) return;
-
-  // Cập nhật max của input
-  DOM.cfgSearch.max = tier.pcSearch;
-  DOM.cfgMobileCount.max = tier.mobileSearch || 20;
-
-  // Nếu giá trị hiện tại vượt giới hạn mới → reset về max
-  const currentPC = parseInt(DOM.cfgSearch.value) || 0;
-  if (currentPC > tier.pcSearch || currentPC === 0) {
-    DOM.cfgSearch.value = tier.pcSearch;
-  }
-
-  const currentMobile = parseInt(DOM.cfgMobileCount?.value) || 0;
-  if (currentMobile > (tier.mobileSearch || 20) || currentMobile === 0) {
-    if (DOM.cfgMobileCount) DOM.cfgMobileCount.value = tier.mobileSearch || 20;
-  }
-
-  // Cập nhật daily cap hiển thị
-  currentDailyCap = tier.dailyPointCap || 100;
-}
-
-// ---- CONFIG ----
 function loadConfig(config) {
-  if (config.rewardsLevel) {
-    DOM.cfgLevel.value = config.rewardsLevel;
-    currentDailyCap = TIER_CAPS[config.rewardsLevel]?.dailyPointCap || 100;
-    syncSearchCountToTier(config.rewardsLevel);
-  }
-  // Sau khi sync, áp dụng saved values (sẽ không vượt max)
-  if (config.searchCount) DOM.cfgSearch.value = Math.min(config.searchCount, parseInt(DOM.cfgSearch.max) || 30);
-  if (config.speedLevel) {
-    DOM.cfgSpeed.value = config.speedLevel;
-    updateSpeedDisplay(config.speedLevel);
-  } else {
-    DOM.cfgSpeed.value = 3;
-    updateSpeedDisplay(3);
-  }
-  if (config.mobileMode !== undefined) {
-    DOM.cfgMobile.checked = config.mobileMode;
-    DOM.mobileCountRow.style.display = config.mobileMode ? 'block' : 'none';
-  }
-  if (config.mobileSearchCount && DOM.cfgMobileCount) {
-    DOM.cfgMobileCount.value = Math.min(config.mobileSearchCount, parseInt(DOM.cfgMobileCount.max) || 20);
-  }
-  if (config.readResult !== undefined) DOM.cfgReadResult.checked = config.readResult;
+  DOM.cfgSearch.value = Math.max(0, Number(config.searchCount) || 30);
+  DOM.cfgSpeed.value = Number(config.speedPreset || config.speedLevel) || 3;
+  updateSpeedDisplay(Number(DOM.cfgSpeed.value));
+  DOM.cfgMobile.checked = !!config.mobileMode;
+  DOM.mobileCountRow.style.display = DOM.cfgMobile.checked ? 'block' : 'none';
+  DOM.cfgMobileCount.value = Math.max(0, Number(config.mobileSearchCount) || 20);
+  DOM.cfgReadResult.checked = config.readResult !== false;
 }
 
 function getConfigFromUI() {
-  const speedLevel = parseInt(DOM.cfgSpeed.value) || 3;
-  const s = SPEED_LEVELS[speedLevel];
+  const speedPreset = Number(DOM.cfgSpeed.value) || 3;
+  const preset = SPEED_PRESETS[speedPreset] || SPEED_PRESETS[3];
   return {
-    rewardsLevel: DOM.cfgLevel.value,
-    searchCount: parseInt(DOM.cfgSearch.value) || 30,
-    mobileSearchCount: parseInt(DOM.cfgMobileCount?.value) || 20,
-    speedLevel: speedLevel,
-    minDelay: s.minDelay,
-    maxDelay: s.maxDelay,
-    waveSize: s.waveSize,
-    wavePauseMin: s.wavePause,
+    searchCount: Math.max(0, Number(DOM.cfgSearch.value) || 0),
+    mobileSearchCount: Math.max(0, Number(DOM.cfgMobileCount.value) || 0),
+    speedPreset,
+    minDelay: preset.minDelay,
+    maxDelay: preset.maxDelay,
     mobileMode: DOM.cfgMobile.checked,
-    readResult: DOM.cfgReadResult?.checked !== false
+    readResult: DOM.cfgReadResult.checked
   };
 }
 
-// ---- AUTO-SAVE ----
-let autoSaveTimer = null;
-
 function showSavedIndicator() {
-  const ind = DOM.autoSaveIndicator;
-  if (!ind) return;
-  ind.classList.add('visible');
-  setTimeout(() => ind.classList.remove('visible'), 1800);
+  if (!DOM.autoSaveIndicator) return;
+  DOM.autoSaveIndicator.classList.add('visible');
+  setTimeout(() => DOM.autoSaveIndicator.classList.remove('visible'), 1800);
 }
-
-// Khi đổi Tier → tự động sync số search về đúng giới hạn tier mới
-DOM.cfgLevel.addEventListener('change', () => {
-  syncSearchCountToTier(DOM.cfgLevel.value);
-  scheduleAutoSave();
-});
 
 function scheduleAutoSave() {
   clearTimeout(autoSaveTimer);
   autoSaveTimer = setTimeout(async () => {
-    const config = getConfigFromUI();
     try {
-      await chrome.runtime.sendMessage({ action: 'save_config', config });
+      await chrome.runtime.sendMessage({ action: 'save_config', config: getConfigFromUI() });
       showSavedIndicator();
-      // Cập nhật daily cap display khi đổi level
-      currentDailyCap = TIER_CAPS[config.rewardsLevel]?.dailyPointCap || 100;
       await loadDailyProgress();
     } catch (e) {}
-  }, 800);
+  }, 500);
 }
 
-// Gán auto-save cho tất cả inputs cấu hình
-['change', 'input'].forEach(ev => {
-  [DOM.cfgLevel, DOM.cfgSearch, DOM.cfgMobile, DOM.cfgReadResult].forEach(el => {
-    el?.addEventListener(ev, scheduleAutoSave);
-  });
-});
-
-// ---- LOGGING ----
 function addLogEntry(entry) {
   const div = document.createElement('div');
   div.className = `log-entry ${entry.type || 'info'}`;
-  div.innerHTML = `<span class="log-time">[${entry.time || '--:--:--'}]</span> ${escapeHtml(entry.text)}`;
-  
-  // Append (newest at bottom — terminal style)
+  div.innerHTML = `<span class="log-time">[${entry.time || '--:--:--'}]</span> ${escapeHtml(entry.text || '')}`;
   DOM.logWindow.appendChild(div);
-  
-  // Auto-scroll to bottom (luôn thấy log mới nhất)
   DOM.logWindow.scrollTop = DOM.logWindow.scrollHeight;
-  
-  // Limit entries (xóa cũ nhất ở trên)
   while (DOM.logWindow.children.length > 100) {
     DOM.logWindow.removeChild(DOM.logWindow.firstChild);
   }
@@ -343,71 +298,72 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
-// ---- MESSAGE LISTENER ----
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.action === 'state_update') updateUI(msg.data);
-  if (msg.action === 'log') addLogEntry(msg.data);
-  if (msg.action === 'daily_progress') updateDailyProgressUI(msg.data);
-});
-
-// ---- EVENT HANDLERS ----
 function sendCommand(command) {
   chrome.runtime.sendMessage({ action: 'command', command });
 }
 
-DOM.btnSearch.addEventListener('click', () => sendCommand('start_search'));
-DOM.btnStop.addEventListener('click', () => sendCommand('stop'));
-DOM.btnMaxMode.addEventListener('click', () => {
-  sendCommand('start_max_mode');
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg.action === 'state_update') updateUI(msg.data);
+  if (msg.action === 'log') addLogEntry(msg.data);
+  if (msg.action === 'daily_progress') updateDailyProgressUI(msg.data);
+  if (msg.action === 'ban_status') renderBanStatus(msg.data);
 });
-DOM.btnTasks.addEventListener('click', () => sendCommand('daily_tasks'));
-DOM.btnPoints.addEventListener('click', () => sendCommand('check_points'));
-DOM.btnResetPage.addEventListener('click', () => sendCommand('reset_page'));
 
-DOM.btnResetProgress.addEventListener('click', () => {
+DOM.btnSearch?.addEventListener('click', () => sendCommand('start_search'));
+DOM.btnStop?.addEventListener('click', () => sendCommand('stop'));
+DOM.btnPoints?.addEventListener('click', () => sendCommand('check_points'));
+DOM.btnCheckBan?.addEventListener('click', () => sendCommand('check_ban'));
+DOM.btnResetPage?.addEventListener('click', () => sendCommand('reset_page'));
+DOM.btnResetProgress?.addEventListener('click', () => {
   if (confirm('Xóa tiến trình hiện tại?')) sendCommand('reset_progress');
 });
-
-// Mobile toggle → hiện/ẩn mobile count
-DOM.cfgMobile.addEventListener('change', () => {
-  DOM.mobileCountRow.style.display = DOM.cfgMobile.checked ? 'block' : 'none';
-  scheduleAutoSave();
+DOM.btnClearData?.addEventListener('click', () => {
+  if (confirm('Xóa cache Bing, lịch sử từ khóa/search URL, autocomplete và site storage?\n\nSession đăng nhập MS/Bing sẽ được giữ nguyên.')) {
+    sendCommand('clear_data');
+  }
 });
-
-// Mobile count auto-save
-DOM.cfgMobileCount?.addEventListener('input', scheduleAutoSave);
-
-DOM.btnClearLogs.addEventListener('click', () => {
+DOM.btnClearLogs?.addEventListener('click', () => {
   DOM.logWindow.innerHTML = '';
   addLogEntry({ text: 'Log cleared', type: 'info', time: new Date().toLocaleTimeString() });
 });
 
-// Max Mode — disable/enable khi đang chạy
-DOM.btnMaxMode.addEventListener('mouseenter', () => {
-  const tier = TIER_CAPS[DOM.cfgLevel.value] || TIER_CAPS.gold;
-  DOM.btnMaxMode.title = `Max Mode: chạy đến hết ${tier.dailyPointCap} pts/ngày`;
+DOM.cfgSpeed?.addEventListener('input', () => {
+  updateSpeedDisplay(Number(DOM.cfgSpeed.value));
+  scheduleAutoSave();
 });
 
-// ---- POLL STATE (backup for when popup was closed) ----
+[DOM.cfgSearch, DOM.cfgMobileCount, DOM.cfgMobile, DOM.cfgReadResult].forEach((el) => {
+  el?.addEventListener('input', scheduleAutoSave);
+  el?.addEventListener('change', scheduleAutoSave);
+});
+
+DOM.cfgMobile?.addEventListener('change', () => {
+  DOM.mobileCountRow.style.display = DOM.cfgMobile.checked ? 'block' : 'none';
+});
+
 setInterval(async () => {
   try {
     const response = await chrome.runtime.sendMessage({ action: 'get_state' });
     if (response?.state) updateUI(response.state);
-  } catch(e) {}
+  } catch (e) {}
 }, 3000);
 
-// ---- INIT ----
 async function init() {
+  initDetachedDrag();
   try {
     const response = await chrome.runtime.sendMessage({ action: 'get_state' });
     if (response?.state) updateUI(response.state);
     if (response?.logs) {
       DOM.logWindow.innerHTML = '';
-      response.logs.forEach(entry => addLogEntry(entry));
+      response.logs.forEach(addLogEntry);
     }
+
     const configResponse = await chrome.runtime.sendMessage({ action: 'get_config' });
     if (configResponse?.config) loadConfig(configResponse.config);
-    // Load daily progress khi mở popup
+
+    const banResponse = await chrome.runtime.sendMessage({ action: 'get_ban_status' });
+    if (banResponse?.banStatus) renderBanStatus(banResponse.banStatus);
+
     await loadDailyProgress();
   } catch (e) {
     addLogEntry({ text: '⚡ Extension ready', type: 'info', time: new Date().toLocaleTimeString() });

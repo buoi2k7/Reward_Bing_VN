@@ -1,0 +1,25 @@
+Earn:
+<span class="relative px-paddingCtrlTextSide inline-flex items-center pt-paddingCtrlTextTop pb-paddingCtrlTextBottom gap-gapBetweenContentXxSmall" style="" xpath="1">
+Earn
+<span class="group-data-disabled/ctrl:hidden rounded-cornerCircular group-hover/ctrl:bg-fgCtrlHintDefault group-active/ctrl:bg-fgCtrlHintDefault absolute inset-x-0 bottom-0 mx-auto h-ctrlListPillWidth w-ctrlListPillLengthRest"></span>
+<div class="rounded-cornerCircular bg-bgCtrlActiveBrandRest forced-colors:bg-[Highlight] group-hover/ctrl:bg-bgCtrlActiveBrandHover group-active/ctrl:bg-bgCtrlActiveBrandPressed group-hover/ctrl:forced-colors:bg-[Highlight] group-active/ctrl:forced-colors:bg-[Highlight] group-data-disabled/ctrl:bg-bgCtrlActiveBrandDisabled group-data-disabled/ctrl:forced-colors:bg-[GrayText] transition-transform duration-slow absolute inset-x-0 bottom-0 mx-auto h-ctrlListPillWidth w-ctrlListPillLengthRest" data-rac=""></div>
+</span>
+point breakdown:
+<div class="flex items-center gap-2 text-fgCtrlNeutralSecondaryRest" xpath="1">
+<p class="text-metadata" style=""></p>
+<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" class="size-3.5 -rotate-90 rtl:rotate-90"></svg>
+</div>
+today's activity:
+<div class="grid w-full items-center gap-x-3 overflow-hidden rounded-cornerCtrlRest border border-strokeCardOnPrimaryRest bg-rewardsTableAltBg" style="grid-template-columns: auto 1fr fit-content(30%) auto;" xpath="1"></div>
+
+div[class='flex flex-col gap-4'] div[class='flex flex-col gap-4'] div[class='grid w-full items-center gap-x-3 overflow-hidden rounded-cornerCtrlRest border border-strokeCardOnPrimaryRest bg-rewardsTableAltBg']
+History:
+body > div:nth-child(93) > div:nth-child(1) > section:nth-child(2) > div:nth-child(1) > div:nth-child(2) > div:nth-child(1) > div:nth-child(3)
+Today point activity (point):
+//div[@class='flex flex-col gap-4']//div[@class='flex flex-col gap-4']//div[@class='col-span-full contents grid-cols-subgrid items-center supports-subgrid:grid bg-bgToolbar text-fgCtrlNeutralSecondaryRest']
+desktop bing search:
+//body//div[@class='fixed inset-0 z-40 flex flex-col items-center justify-center bg-transparent']//div[@class='flex flex-col gap-4']//div[@class='flex flex-col gap-4']//div[3]
+mobile bing search
+//p[normalize-space()='Mobile Bing search']
+o ffers
+//p[normalize-space()='Offers']

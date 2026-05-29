@@ -1,2191 +1,1925 @@
 // =============================================
-// BING REWARDS AUTO - BACKGROUND SERVICE WORKER
-// Extension-native: No server, no CDP ports
-// Uses chrome.tabs + chrome.scripting APIs
+// BING REWARDS AUTO v4.1 — BACKGROUND SERVICE WORKER
+// Compact search runner:
+//   - No Rewards Level / tier logic.
+//   - No wave pauses.
+//   - No 3-search/15-minute cooldown.
+//   - Direct PC + optional Mobile counts from the popup.
 // =============================================
 
-// Load network handler for robust API calls
-try {
-  importScripts('api-network-handler.js');
-} catch (e) {
-  console.error('Failed to load api-network-handler:', e);
-}
+importScripts('keywords-data.js', 'mobile-devices.js', 'api-network-handler.js', 'ban-detection.js');
 
-// Load mobile device pool (40+ real devices)
-try {
-  importScripts('mobile-devices.js');
-} catch (e) {
-  console.error('Failed to load mobile-devices:', e);
-}
+// ═══════════════════════════════════════════════
+// CONSTANTS & CONFIG
+// ═══════════════════════════════════════════════
 
-// Load daily tasks module (runDailyTasks + runMobileDailyTasks)
-try {
-  importScripts('daily_tasks_new.js');
-} catch (e) {
-  console.error('Failed to load daily_tasks_new:', e);
-}
+// Delay presets in seconds. These are the only pacing controls now.
+const SPEED_PRESETS = {
+  1: { name: 'Chậm',       minDelay: 35, maxDelay: 55, color: '#10b981' },
+  2: { name: 'Êm',         minDelay: 24, maxDelay: 36, color: '#34d399' },
+  3: { name: 'Vừa',        minDelay: 14, maxDelay: 24, color: '#00e5ff' },
+  4: { name: 'Nhanh',      minDelay: 8,  maxDelay: 14, color: '#f59e0b' },
+  5: { name: 'Rất nhanh',  minDelay: 5,  maxDelay: 9,  color: '#ef4444' },
+  6: { name: 'Tối đa',     minDelay: 3,  maxDelay: 6,  color: '#dc2626' }
+};
 
-// ---- STATE ----
+// ═══════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════
+
 let state = {
-  status: 'idle',        // idle | running | stopped | done | error | cooldown
+  status: 'idle',       // idle | running | stopped | done | error
+  phase: 'pc',          // pc | mobile
   progress: '0/0',
   percent: 0,
-  points: {
-    current: null,     // null = chưa check, number = đã có data thật
-    earned: 0,         // chỉ từ verified API checks
-    baseline: null,    // điểm trước khi bắt đầu search
-    lastCheck: null,   // timestamp lần check cuối
-    history: []        // [{ time, points, wave, delta }]
-  },
-  currentSearch: 0,
-  totalSearches: 0,
-  wave: { current: 0, total: 0 },
-  logs: [],
-  mobileRuleEnabled: false
+  points: { current: null, earned: null, baseline: null },
+  currentQuery: '',
 };
 
-const DEFAULT_CONFIG = {
-  rewardsLevel: 'gold',
+let config = {
   searchCount: 30,
   mobileSearchCount: 20,
-  speedLevel: 3,
-  minDelay: 20,
-  maxDelay: 40,
+  speedPreset: 3,
+  minDelay: 14,
+  maxDelay: 24,
   mobileMode: false,
-  maxRetries: 2,
-  waveSize: 5,
-  wavePauseMin: 8,   // minutes — reduced from 15
-  readResult: true,  // click 1 kết quả sau search để simulate đọc thật
-  maxMode: false     // chạy đến đủ điểm trong ngày
+  readResult: true,
 };
 
-// Giới hạn PC search và Mobile search theo hạng (2026)
-const TIER_LIMITS = {
-  'member': { pcSearch: 10,  mobileSearch: 0,  dailyPointCap: 15  },
-  'silver': { pcSearch: 15,  mobileSearch: 10, dailyPointCap: 30  },
-  'gold':   { pcSearch: 30,  mobileSearch: 20, dailyPointCap: 100 }
+let dailyProgress = {
+  date: '',
+  earnedToday: 0,
+  searchesDone: 0,
+  pcDone: 0,
+  mobileDone: 0,
+  pointsBefore: null,
 };
 
-// Speed level presets (matches popup.js SPEED_LEVELS)
-const SPEED_PRESETS = {
-  1: { minDelay: 50, maxDelay: 90,  waveSize: 2, wavePause: 20 },
-  2: { minDelay: 35, maxDelay: 60,  waveSize: 3, wavePause: 12 },
-  3: { minDelay: 20, maxDelay: 40,  waveSize: 5, wavePause: 8  },
-  4: { minDelay: 12, maxDelay: 25,  waveSize: 6, wavePause: 4  },
-  5: { minDelay: 8,  maxDelay: 15,  waveSize: 7, wavePause: 3  },
-  6: { minDelay: 5,  maxDelay: 10,  waveSize: 8, wavePause: 2  }
+// Runtime vars
+let searchTab = null;
+let isRunning = false;
+let logBuffer = [];
+const MAX_LOG_ENTRIES = 150;
+let runStartTime = 0;
+let banStatus = {
+  status: 'UNKNOWN', // UNKNOWN | OK | WARN | BAN
+  reasons: [],
+  signals: {},
+  updatedAt: null
 };
 
-// ---- HELPERS ----
-function sleep(ms) { 
-  const checkInterval = 100;
-  const start = Date.now();
-  return new Promise((resolve, reject) => {
-    const timer = setInterval(() => {
-      if (state.status === 'stopped' || state.status === 'error') {
-        clearInterval(timer);
-        reject(new Error('USER_STOPPED'));
-      } else if (Date.now() - start >= ms) {
-        clearInterval(timer);
-        resolve(true);
-      }
-    }, checkInterval);
-  });
-}
+// ═══════════════════════════════════════════════
+// UTILITIES
+// ═══════════════════════════════════════════════
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
 function randomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-function randomDelay(minS, maxS) { return randomInt(minS * 1000, maxS * 1000); }
 
-// ---- ENHANCED LOGGING ----
-function log(text, type = 'info', metadata = {}) {
-  const timestamp = new Date();
-  const timeString = timestamp.toLocaleTimeString();
+function gaussianDelay(min, max) {
+  const u1 = Math.random();
+  const u2 = Math.random();
+  const z = Math.sqrt(-2 * Math.log(u1 || 0.001)) * Math.cos(2 * Math.PI * u2);
+  const mean = (min + max) / 2;
+  const stddev = (max - min) / 6;
+  return Math.round(Math.max(min, Math.min(max, mean + z * stddev)));
+}
+
+function getAdjustedDelay() {
+  const speed = SPEED_PRESETS[config.speedPreset] || SPEED_PRESETS[3];
+  return gaussianDelay(speed.minDelay, speed.maxDelay) * 1000;
+}
+
+function now() { return new Date().toLocaleTimeString('vi-VN', { hour12: false }); }
+
+// ═══════════════════════════════════════════════
+// LOGGING
+// ═══════════════════════════════════════════════
+
+function log(text, type = 'info') {
+  const entry = { text, type, time: now() };
+  logBuffer.push(entry);
+  if (logBuffer.length > MAX_LOG_ENTRIES) logBuffer.shift();
   
-  // Structured log entry
-  const entry = {
-    text,
-    type, // 'info', 'success', 'warning', 'error'
-    time: timeString,
-    timestamp: timestamp.getTime(),
-    ...metadata // Add context like { endpoint: '/api/...', attempt: 2, duration: 1500 }
-  };
-  
-  // Keep last 200 logs
-  state.logs.unshift(entry);
-  if (state.logs.length > 200) state.logs.length = 200;
-  
-  // Broadcast to UI
-  broadcast({ action: 'log', data: entry });
-  
-  // Also console.log for debugging
-  const logColor = {
-    'info': '\x1b[36m',    // cyan
-    'success': '\x1b[32m', // green
-    'warning': '\x1b[33m', // yellow
-    'error': '\x1b[31m'    // red
-  }[type] || '\x1b[0m';
-  
-  console.log(`${logColor}[${timeString}] ${text}\x1b[0m`, metadata);
+  // Broadcast to popup
+  broadcast('log', entry);
+  console.log(`[BRA ${type}] ${text}`);
 }
 
-function broadcast(msg) {
-  chrome.runtime.sendMessage(msg).catch(() => {});
+// ═══════════════════════════════════════════════
+// STATE MANAGEMENT
+// ═══════════════════════════════════════════════
+
+function updateState(patch) {
+  Object.assign(state, patch);
+  broadcast('state_update', state);
 }
 
-function broadcastState() {
-  broadcast({ action: 'state_update', data: getPublicState() });
-}
-
-function getPublicState() {
-  return {
-    ...state,
-    logs: undefined,
-    points: {
-      current: state.points.current,
-      earned: state.points.earned,
-      baseline: state.points.baseline,
-      lastCheck: state.points.lastCheck,
-      historyCount: state.points.history.length
-    }
-  };
-}
-
-// ---- CONFIG ----
-async function getConfig() {
-  const result = await chrome.storage.local.get('config');
-  return { ...DEFAULT_CONFIG, ...(result.config || {}) };
-}
-
-async function saveConfig(config) {
-  await chrome.storage.local.set({ config });
-}
-
-// ---- KEYWORDS ----
-// Loaded from keywords-data.js via importScripts
-let KEYWORDS = [];
-try {
-  importScripts('keywords-data.js');
-  KEYWORDS = self.KEYWORD_LIST || [];
-} catch (e) {
-  console.error('Failed to load keywords:', e);
-}
-
-function getRandomKeyword() {
-  return KEYWORDS[Math.floor(Math.random() * KEYWORDS.length)] || 'tin tức hôm nay';
-}
-
-// ---- TIME-OF-DAY SPEED PROFILE (từ ReFree Pro) ----
-// Điều chỉnh tốc độ theo giờ trong ngày để hành vi giống người thật hơn
-function getTimeOfDayProfile() {
-  const hour = new Date().getHours();
-  if (hour >= 6  && hour < 11) return { name: 'morning',   label: '🌅 Sáng',   activityMult: 0.7 };
-  if (hour >= 11 && hour < 17) return { name: 'afternoon', label: '☀️ Chiều',  activityMult: 1.0 };
-  if (hour >= 17 && hour < 22) return { name: 'evening',   label: '🌆 Tối',    activityMult: 1.2 };
-  // 22h-6h sáng: chạy chậm hẳn — người thật ít search ban đêm
-  return { name: 'night', label: '🌙 Khuya', activityMult: 0.4 };
-}
-
-// Áp dụng time profile vào delay config
-function applyTimeProfile(config) {
-  const profile = getTimeOfDayProfile();
-  const mult = profile.activityMult;
-  // Ban đêm: tăng delay, giảm wave size
-  if (profile.name === 'night') {
-    return {
-      ...config,
-      minDelay: Math.round(config.minDelay / mult),   // delay dài hơn
-      maxDelay: Math.round(config.maxDelay / mult),
-      waveSize: Math.max(2, Math.floor((config.waveSize || 5) * mult)),
-    };
-  }
-  // Tối: hơi nhanh hơn bình thường
-  if (profile.name === 'evening') {
-    return {
-      ...config,
-      minDelay: Math.round(config.minDelay * 0.85),
-      maxDelay: Math.round(config.maxDelay * 0.85),
-    };
-  }
-  return config;
-}
-
-// ---- COFFEE BREAK (từ AutoRewarder) ----
-// Dừng dài sau mỗi N search để giống người thật uống nước
-function getNextCoffeeBreak() {
-  // 80% nghỉ sau 4-9 searches, 20% nghỉ sau 10-15 searches
-  return Math.random() < 0.8
-    ? randomInt(4, 9)
-    : randomInt(10, 15);
-}
-
-// ---- BING TAB CATEGORY SWITCH (từ AutoRewarder) ----
-// Sau khi search xong, 30% chance chuyển sang tab Images/Videos/News
-async function performTabCategorySwitch(tabId) {
-  const CATEGORIES = [
-    { name: 'All',    selector: null,                   weight: 70 },
-    { name: 'Images', selector: '#b-scopeListItem-images a', weight: 10 },
-    { name: 'Videos', selector: '#b-scopeListItem-video a',  weight: 10 },
-    { name: 'News',   selector: '#b-scopeListItem-news a',   weight: 10 },
-  ];
-
-  // Weighted random pick
-  const total = CATEGORIES.reduce((sum, c) => sum + c.weight, 0);
-  let r = Math.random() * total;
-  let chosen = CATEGORIES[0];
-  for (const cat of CATEGORIES) {
-    r -= cat.weight;
-    if (r <= 0) { chosen = cat; break; }
-  }
-
-  if (chosen.name === 'All' || !chosen.selector) return; // 70% không làm gì
-
+function broadcast(action, data) {
   try {
-    await injectScript(tabId, (sel) => {
-      const el = document.querySelector(sel);
-      if (el) {
-        el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-        setTimeout(() => el.click(), 200 + Math.floor(Math.random() * 400));
-        return true;
-      }
-      return false;
-    }, [chosen.selector]);
-    log(`🗂 Tab switch: ${chosen.name}`);
-    await sleep(randomInt(2000, 4500));
+    chrome.runtime.sendMessage({ action, data }).catch(() => {});
+  } catch (e) {}
+}
+
+async function updateBanIndicatorUI() {
+  try {
+    const status = banStatus?.status || 'UNKNOWN';
+    const badgeTextMap = {
+      UNKNOWN: '…',
+      OK: 'OK',
+      WARN: '!',
+      BAN: 'BAN'
+    };
+    const badgeColorMap = {
+      UNKNOWN: '#64748b',
+      OK: '#10b981',
+      WARN: '#f59e0b',
+      BAN: '#ef4444'
+    };
+
+    await chrome.action.setBadgeText({ text: badgeTextMap[status] || '…' });
+    await chrome.action.setBadgeBackgroundColor({ color: badgeColorMap[status] || '#64748b' });
+
+    const titleReason = (banStatus?.reasons || []).slice(0, 2).join(' | ');
+    const title = titleReason
+      ? `Bing Rewards Auto — ${status}: ${titleReason}`
+      : `Bing Rewards Auto — ${status}`;
+    await chrome.action.setTitle({ title });
   } catch (e) {
-    // Không quan trọng nếu fail, tiếp tục bình thường
+    // ignore badge/title update errors
   }
 }
 
-// ---- TAB HELPERS ----
-async function createTab(url, active = false) {
-  return chrome.tabs.create({ url, active });
-}
-
-async function waitForTabLoad(tabId, timeout = 30000) {
-  return new Promise((resolve, reject) => {
-    let resolved = false;
-
-    function listener(tid, info) {
-      if (tid === tabId && info.status === 'complete') {
-        if (!resolved) {
-          resolved = true;
-          chrome.tabs.onUpdated.removeListener(listener);
-          resolve();
+async function loadConfig() {
+  return new Promise(resolve => {
+    chrome.storage.local.get(['config', 'dailyProgress'], result => {
+      if (result.config) Object.assign(config, result.config);
+      if (config.speedLevel && !config.speedPreset) config.speedPreset = config.speedLevel;
+      delete config.speedLevel;
+      delete config.rewardsLevel;
+      delete config.waveSize;
+      delete config.wavePauseMin;
+      chrome.storage.local.set({ config });
+      if (result.dailyProgress) {
+        const today = new Date().toDateString();
+        if (result.dailyProgress.date === today) {
+          Object.assign(dailyProgress, result.dailyProgress);
+        } else {
+          // New day — reset
+          dailyProgress = { date: today, earnedToday: 0, searchesDone: 0, pcDone: 0, mobileDone: 0, pointsBefore: null };
+          chrome.storage.local.set({ dailyProgress });
         }
       }
-    }
-    chrome.tabs.onUpdated.addListener(listener);
-
-    const start = Date.now();
-    const watcher = setInterval(() => {
-      if (resolved) {
-        clearInterval(watcher);
-        return;
-      }
-      if (state.status === 'stopped' || state.status === 'error') {
-        resolved = true;
-        clearInterval(watcher);
-        chrome.tabs.onUpdated.removeListener(listener);
-        reject(new Error('USER_STOPPED'));
-      } else if (Date.now() - start >= timeout) {
-        resolved = true;
-        clearInterval(watcher);
-        chrome.tabs.onUpdated.removeListener(listener);
-        reject(new Error('Tab load timeout'));
-      }
-    }, 100);
+      resolve();
+    });
   });
 }
 
-async function injectScript(tabId, func, args = []) {
+async function saveConfig() {
+  return new Promise(resolve => {
+    chrome.storage.local.set({ config }, resolve);
+  });
+}
+
+async function saveDailyProgress() {
+  dailyProgress.date = new Date().toDateString();
+  return new Promise(resolve => {
+    chrome.storage.local.set({ dailyProgress }, resolve);
+  });
+}
+
+function todayKey() {
+  return new Date().toDateString();
+}
+
+async function getCachedSearchQuota() {
+  return new Promise(resolve => {
+    chrome.storage.local.get('searchQuota', ({ searchQuota }) => {
+      if (!searchQuota || searchQuota.date !== todayKey()) {
+        resolve(null);
+        return;
+      }
+      resolve(searchQuota);
+    });
+  });
+}
+
+async function saveSearchQuota(quota) {
+  return new Promise(resolve => {
+    chrome.storage.local.set({
+      searchQuota: {
+        ...quota,
+        date: todayKey(),
+        updatedAt: new Date().toISOString()
+      }
+    }, resolve);
+  });
+}
+
+async function cacheSearchQuotaFromActivities(activities) {
+  const pc = activities.find(item => item.source === 'earn-breakdown' && item.key === 'bingSearch');
+  const mobile = activities.find(item => item.source === 'earn-breakdown' && item.key === 'mobileSearch');
+  if (!pc && !mobile) return null;
+
+  const cached = await getCachedSearchQuota() || {};
+  const quota = {
+    ...cached,
+    source: 'earn-breakdown'
+  };
+
+  if (pc) {
+    quota.pc = pc.remaining;
+    quota.pcCurrent = pc.current;
+    quota.pcMax = pc.max;
+  }
+
+  if (mobile) {
+    quota.mobile = mobile.remaining;
+    quota.mobileCurrent = mobile.current;
+    quota.mobileMax = mobile.max;
+  }
+
+  await saveSearchQuota(quota);
+  return quota;
+}
+
+async function consumeSearchQuota(phase, count = 1) {
+  const quota = await getCachedSearchQuota();
+  if (!quota) return;
+
+  const key = phase === 'mobile' ? 'mobile' : 'pc';
+  if (Number.isFinite(Number(quota[key]))) {
+    quota[key] = Math.max(0, Number(quota[key]) - count);
+    await saveSearchQuota(quota);
+  }
+}
+
+// ═══════════════════════════════════════════════
+// MESSAGE HANDLER (Protocol matching popup.js)
+// ═══════════════════════════════════════════════
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  switch (msg.action) {
+    case 'command':
+      handleCommand(msg.command);
+      sendResponse({ ok: true });
+      break;
+
+    case 'get_state':
+      sendResponse({ state, logs: logBuffer.slice(-50) });
+      break;
+
+    case 'get_config':
+      sendResponse({ config });
+      break;
+
+    case 'save_config':
+      if (msg.config) {
+        Object.assign(config, msg.config);
+        saveConfig();
+      }
+      sendResponse({ ok: true });
+      break;
+
+    case 'get_daily_progress':
+      sendResponse({ dp: dailyProgress });
+      break;
+
+    case 'openExtractor':
+      chrome.tabs.create({
+        url: chrome.runtime.getURL('extract.html'),
+        active: true
+      });
+      sendResponse({ ok: true });
+      break;
+
+    case 'intercepted_data':
+      // Received intercepted API data from content-intercept.js bridge
+      handleInterceptedData(msg.key, msg.data);
+      sendResponse({ ok: true });
+      break;
+
+    case 'get_intercepted':
+      sendResponse({ interceptedCache });
+      break;
+
+    case 'BAN_STATUS_UPDATE':
+      handleBanStatusUpdate(msg.apiData, msg.timestamp);
+      sendResponse({ ok: true });
+      break;
+
+    case 'get_ban_status':
+      sendResponse({ banStatus });
+      break;
+
+    default:
+      sendResponse({ error: 'unknown' });
+  }
+  return false;
+});
+
+// ═══════════════════════════════════════════════
+// INTERCEPT DATA HANDLER
+// ═══════════════════════════════════════════════
+
+let interceptedCache = {
+  userInfo: null,
+  userInfoFull: null,
+  pointsBreakdown: null,
+  lastUpdate: 0,
+  searchProgress: { pc: null, mobile: null, edge: null },
+  points: null,
+};
+
+function handleInterceptedData(key, data) {
+  if (!key || !data) return;
+  interceptedCache[key] = data;
+  interceptedCache.lastUpdate = Date.now();
+
+  // Auto-parse points and search progress
+  try {
+    const dashboard = data?.dashboard || data;
+    const userStatus = dashboard?.userStatus || {};
+    const counters = userStatus.counters || {};
+
+    if (typeof userStatus.availablePoints === 'number') {
+      interceptedCache.points = userStatus.availablePoints;
+      state.points.current = userStatus.availablePoints;
+      if (dailyProgress.pointsBefore !== null) {
+        state.points.earned = userStatus.availablePoints - dailyProgress.pointsBefore;
+        dailyProgress.earnedToday = state.points.earned;
+      }
+      updateState({ points: state.points });
+      log(`📡 Intercept: ${userStatus.availablePoints} pts`, 'info');
+    }
+
+    // Parse search counters
+    for (const [cKey, counter] of Object.entries(counters)) {
+      if (!counter || typeof counter !== 'object') continue;
+      const name = (counter.name || counter.description || cKey || '').toLowerCase();
+      const progress = counter.count ?? counter.pointProgress ?? counter.progress ?? counter.pointprogress ?? 0;
+      const max = counter.max ?? counter.pointProgressMax ?? counter.target ?? counter.completionTarget ?? counter.maxValue ?? counter.goal ?? counter.pointprogressmax ?? 0;
+      const complete = counter.complete || false;
+
+      if (name.includes('pc') || name.includes('desktop')) {
+        interceptedCache.searchProgress.pc = { progress, max, complete };
+      } else if (name.includes('mobile')) {
+        interceptedCache.searchProgress.mobile = { progress, max, complete };
+      } else if (name.includes('edge')) {
+        interceptedCache.searchProgress.edge = { progress, max, complete };
+      }
+    }
+  } catch (e) {
+    console.warn('[BRA] Intercept parse error:', e);
+  }
+}
+
+// Inject intercept script into rewards tab and read cached data
+async function injectInterceptAndRead(tabId) {
+  try {
+    // Try reading from the page's window.__BRA_GET_SUMMARY__
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: () => {
+        if (typeof window.__BRA_GET_SUMMARY__ === 'function') {
+          return window.__BRA_GET_SUMMARY__();
+        }
+        return null;
+      }
+    });
+    const summary = results?.[0]?.result;
+    if (summary && summary.hasData) {
+      log(`📡 Intercept data found: ${summary.interceptCount} API calls captured`, 'info');
+      if (summary.points !== null) {
+        interceptedCache.points = summary.points;
+        state.points.current = summary.points;
+        updateState({ points: state.points });
+      }
+      if (summary.pc) interceptedCache.searchProgress.pc = summary.pc;
+      if (summary.mobile) interceptedCache.searchProgress.mobile = summary.mobile;
+      return summary;
+    }
+  } catch (e) {
+    // Expected if tab is not a rewards page
+  }
+  return null;
+}
+
+// Get points preferring intercepted data, fallback to API
+async function getPointsWithIntercept() {
+  // 1. Check intercepted cache (< 2 min old)
+  if (interceptedCache.points !== null && (Date.now() - interceptedCache.lastUpdate) < 120000) {
+    return interceptedCache.points;
+  }
+  // 2. Try reading from any open rewards tab
+  try {
+    const tabs = await chrome.tabs.query({ url: ['*://rewards.bing.com/*', '*://rewards.microsoft.com/*'] });
+    for (const tab of tabs) {
+      const summary = await injectInterceptAndRead(tab.id);
+      if (summary?.points !== null) return summary.points;
+    }
+  } catch (e) {}
+  // 3. Fallback to direct API
+  return await scrapePointsFromAPI();
+}
+
+function handleCommand(command) {
+  switch (command) {
+    case 'start_search':
+      startSearch();
+      break;
+    case 'start_max_mode':
+      startSearch();
+      break;
+    case 'stop':
+      stopSearch();
+      break;
+    case 'check_points':
+      checkPoints();
+      break;
+    case 'check_ban':
+      checkAccountDiagnostics();
+      break;
+    case 'reset_page':
+      resetPage();
+      break;
+    case 'reset_progress':
+      resetProgress();
+      break;
+    case 'clear_data':
+      clearBingData();
+      break;
+    case 'open_control_window':
+      openControlWindow();
+      break;
+  }
+}
+
+// ═══════════════════════════════════════════════
+// SEARCH ENGINE — Core Logic
+// ═══════════════════════════════════════════════
+
+async function startSearch() {
+  if (isRunning) {
+    log('⚠️ Đang chạy rồi', 'warn');
+    return;
+  }
+
+  await loadConfig();
+  isRunning = true;
+  runStartTime = Date.now();
+
+  const speed = SPEED_PRESETS[config.speedPreset] || SPEED_PRESETS[3];
+  let pcCount = Math.max(0, Number(config.searchCount) || 0);
+  let mobileCount = config.mobileMode ? Math.max(0, Number(config.mobileSearchCount) || 0) : 0;
+
+  const activityPlan = await getActivitySearchPlan(pcCount, mobileCount);
+  pcCount = activityPlan.pcCount;
+  mobileCount = activityPlan.mobileCount;
+
+  if (pcCount <= 0 && mobileCount <= 0) {
+    log(activityPlan.reason || '⚠️ Không còn lượt search cần chạy theo dữ liệu activity.', 'warn');
+    updateState({ status: 'done' });
+    isRunning = false;
+    return;
+  }
+
+  // Snapshot baseline points
+  const basePoints = await scrapePointsFromAPI();
+  if (basePoints !== null) {
+    dailyProgress.pointsBefore = dailyProgress.pointsBefore ?? basePoints;
+    state.points.baseline = dailyProgress.pointsBefore;
+    state.points.current = basePoints;
+    state.points.earned = basePoints - dailyProgress.pointsBefore;
+  }
+
+  log(`🚀 Bắt đầu — PC: ${pcCount}, Mobile: ${mobileCount} | Tốc độ: ${speed.name} (${speed.minDelay}-${speed.maxDelay}s)`, 'info');
+  if (pcCount > 0) {
+    await runSearchPhase('pc', pcCount, speed);
+  }
+
+  if (mobileCount > 0 && isRunning) {
+    log('📱 Chuyển sang Mobile search...', 'info');
+    const switchDelay = randomInt(5, 15) * 1000;
+    log(`⏳ Chờ ${Math.round(switchDelay/1000)}s trước khi chạy mobile...`, 'info');
+    await sleep(switchDelay);
+    
+    if (isRunning) {
+      await runSearchPhase('mobile', mobileCount, speed);
+    }
+  }
+
+  if (isRunning) {
+    const finalPoints = await scrapePointsFromAPI();
+    let earnedStr = '';
+    if (finalPoints !== null && dailyProgress.pointsBefore !== null) {
+      const earned = finalPoints - dailyProgress.pointsBefore;
+      dailyProgress.earnedToday = earned;
+      state.points.current = finalPoints;
+      state.points.earned = earned;
+      earnedStr = ` | Kiếm được: +${earned} pts`;
+    }
+    
+    log(`🎯 HOÀN THÀNH! Searches: ${dailyProgress.searchesDone}${earnedStr}`, 'success');
+    updateState({ status: 'done' });
+    await saveDailyProgress();
+    
+    // Open done page
+    openDonePage();
+  }
+
+  isRunning = false;
+}
+
+async function runSearchPhase(phase, count, speed) {
+  updateState({ status: 'running', phase });
+
+  // Get keywords
+  const allKeywords = self.getAllKeywords();
+  const keywords = [];
+  const usedSet = new Set();
+  
+  for (let i = 0; i < count && allKeywords.length > 0; i++) {
+    let kw;
+    let attempts = 0;
+    do {
+      kw = allKeywords[randomInt(0, allKeywords.length - 1)];
+      attempts++;
+    } while (usedSet.has(kw) && attempts < 50);
+    usedSet.add(kw);
+    keywords.push(kw);
+  }
+
+  // Setup mobile if needed
+  let mobileDevice = null;
+  if (phase === 'mobile') {
+    mobileDevice = getRandomMobileDevice();
+    await ensureSearchTab(phase);
+    await enableMobileUA(mobileDevice);
+    if (searchTab) {
+      await chrome.tabs.update(searchTab, { url: 'https://www.bing.com/' });
+      await waitForTabLoad(searchTab, 20000);
+      await sleep(randomInt(800, 1500));
+    }
+    log(`📱 Mobile device: ${mobileDevice.name}`, 'info');
+  }
+
+  let searchesDone = 0;
+
+  for (let i = 0; i < keywords.length && isRunning; i++) {
+    const keyword = keywords[i];
+    updateState({
+      progress: `${searchesDone}/${count}`,
+      percent: Math.round((searchesDone / count) * 100),
+      currentQuery: keyword,
+    });
+
+    log(`🔍 [${searchesDone + 1}/${count}] "${keyword}"`, 'search');
+
+    const success = await performSingleSearch(keyword, phase, mobileDevice);
+    
+    if (success) {
+      searchesDone++;
+      dailyProgress.searchesDone++;
+      if (phase === 'pc') dailyProgress.pcDone++;
+      else dailyProgress.mobileDone++;
+      await saveDailyProgress();
+      await consumeSearchQuota(phase, 1);
+      broadcast('daily_progress', dailyProgress);
+    }
+
+    if (i < keywords.length - 1 && isRunning) {
+      const delay = getAdjustedDelay();
+      log(`⏳ Đợi ${Math.round(delay/1000)}s...`, 'delay');
+      await sleep(delay);
+    }
+  }
+
+  // Cleanup mobile
+  if (phase === 'mobile') {
+    await disableMobileUA();
+  }
+
+  // Close search tab
+  await closeSearchTab();
+
+  updateState({
+    progress: `${searchesDone}/${count}`,
+    percent: 100,
+    currentQuery: '',
+  });
+}
+
+// ═══════════════════════════════════════════════
+// SINGLE SEARCH
+// ═══════════════════════════════════════════════
+
+async function performSingleSearch(keyword, phase, mobileDevice) {
+  try {
+    // Ensure tab exists
+    await ensureSearchTab(phase);
+    
+    if (!searchTab) {
+      log('❌ Không thể tạo tab tìm kiếm', 'error');
+      return false;
+    }
+
+    // Inject automation script
+    await injectContentScript(searchTab);
+
+    // Step 1: Get search box coordinates
+    const coords = await executeInTab(searchTab, () => {
+      return window.__BRA__?.getSearchCoords();
+    });
+
+    if (!coords) {
+      // Fallback: navigate directly via URL
+      return await fallbackUrlSearch(keyword, phase);
+    }
+
+    // Step 2: Click on search input (coordinate-based)
+    await executeInTab(searchTab, (x, y) => {
+      return window.__BRA__?.humanClickAtCoords(x, y);
+    }, [coords.inputX, coords.inputY]);
+    
+    await sleep(randomInt(300, 700));
+
+    // Step 3: Clear existing text
+    await executeInTab(searchTab, () => {
+      const input = document.querySelector('#sb_form_q') 
+        || document.querySelector('textarea[name="q"]')
+        || document.querySelector('input[name="q"]');
+      if (input) {
+        input.value = '';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    });
+    
+    await sleep(randomInt(200, 500));
+
+    // Step 4: Type keyword (human-like with typos)
+    const typingSpeed = config.speedPreset <= 2 ? 'slow' : config.speedPreset >= 5 ? 'fast' : 'medium';
+    await executeInTab(searchTab, (kw, speed) => {
+      const input = document.querySelector('#sb_form_q') 
+        || document.querySelector('textarea[name="q"]')
+        || document.querySelector('input[name="q"]');
+      if (input) return window.__BRA__?.humanTypeString(input, kw, speed);
+    }, [keyword, typingSpeed]);
+    
+    await sleep(randomInt(400, 1000));
+
+    // Step 5: Submit search (click button or press Enter)
+    if (coords.hasBtn && Math.random() < 0.6) {
+      // 60% click button
+      await executeInTab(searchTab, (x, y) => {
+        return window.__BRA__?.humanClickAtCoords(x, y);
+      }, [coords.btnX, coords.btnY]);
+    } else {
+      // 40% press Enter (or fallback)
+      await executeInTab(searchTab, () => {
+        const form = document.querySelector('#sb_form');
+        if (form) form.submit();
+        else {
+          const input = document.querySelector('#sb_form_q') 
+            || document.querySelector('textarea[name="q"]')
+            || document.querySelector('input[name="q"]');
+          if (input) {
+            input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+            input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+          }
+        }
+      });
+    }
+
+    // Step 6: Wait for page load
+    await waitForTabLoad(searchTab, 15000);
+    await sleep(randomInt(1000, 2500));
+
+    // Step 7: Re-inject content script after navigation
+    await injectContentScript(searchTab);
+
+    // Step 8: Optional result-page interaction
+    if (config.readResult) {
+      await executeInTab(searchTab, () => {
+        return window.__BRA__?.enhancedSearchInteraction();
+      });
+    } else {
+      // Even without readResult, do minimal scroll (looks more natural)
+      await executeInTab(searchTab, () => {
+        window.scrollBy({ top: Math.random() * 300 + 100, behavior: 'smooth' });
+      });
+      await sleep(randomInt(1500, 4000));
+    }
+
+    // Step 9: Occasionally click a result (15% chance)
+    if (config.readResult && Math.random() < 0.15) {
+      await clickResultAndRead();
+    }
+
+    return true;
+
+  } catch (error) {
+    log(`⚠️ Search error: ${error.message}`, 'warn');
+    // Try fallback
+    return await fallbackUrlSearch(keyword, phase);
+  }
+}
+
+// Fallback: navigate directly to search URL
+async function fallbackUrlSearch(keyword, phase) {
+  try {
+    const url = `https://www.bing.com/search?q=${encodeURIComponent(keyword)}&form=QBLH&sp=-1&lq=0&pq=${encodeURIComponent(keyword.toLowerCase())}&sc=0-${keyword.length}&qs=n&sk=`;
+    
+    if (searchTab) {
+      await chrome.tabs.update(searchTab, { url });
+    } else {
+      const tab = await chrome.tabs.create({ url, active: false });
+      searchTab = tab.id;
+    }
+    
+    await waitForTabLoad(searchTab, 20000);
+    await sleep(randomInt(2000, 5000));
+    
+    // Inject and simulate reading
+    await injectContentScript(searchTab);
+    if (config.readResult) {
+      await executeInTab(searchTab, () => {
+        return window.__BRA__?.enhancedSearchInteraction();
+      });
+    }
+    
+    return true;
+  } catch (e) {
+    log(`❌ Fallback search failed: ${e.message}`, 'error');
+    return false;
+  }
+}
+
+// Click a search result and read briefly
+async function clickResultAndRead() {
+  try {
+    const resultCoords = await executeInTab(searchTab, async () => {
+      return await window.__BRA__?.getResultCoords();
+    });
+
+    if (resultCoords) {
+      log(`📖 Click kết quả: "${resultCoords.title}"`, 'info');
+      
+      await executeInTab(searchTab, (x, y) => {
+        return window.__BRA__?.humanClickAtCoords(x, y);
+      }, [resultCoords.x, resultCoords.y]);
+
+      // Wait on result page (simulate reading 5-12 seconds)
+      const readTime = randomInt(5000, 12000);
+      await sleep(readTime);
+
+      // Go back to search results
+      try {
+        await chrome.tabs.goBack(searchTab);
+        await waitForTabLoad(searchTab, 10000);
+        await sleep(randomInt(500, 1500));
+      } catch (e) {
+        // If goBack fails, navigate to Bing
+        await chrome.tabs.update(searchTab, { url: 'https://www.bing.com/' });
+        await waitForTabLoad(searchTab, 10000);
+      }
+    }
+  } catch (e) {
+    // Non-critical — ignore
+  }
+}
+
+// ═══════════════════════════════════════════════
+// TAB MANAGEMENT
+// ═══════════════════════════════════════════════
+
+async function ensureSearchTab(phase) {
+  // Check if tab still exists
+  if (searchTab) {
+    try {
+      await chrome.tabs.get(searchTab);
+      return; // Tab exists
+    } catch (e) {
+      searchTab = null;
+    }
+  }
+
+  // Create new tab
+  const url = 'https://www.bing.com/';
+  const tab = await chrome.tabs.create({ url, active: false });
+  searchTab = tab.id;
+  await waitForTabLoad(searchTab, 20000);
+  await sleep(randomInt(1000, 2000));
+}
+
+async function closeSearchTab() {
+  if (searchTab) {
+    try {
+      await chrome.tabs.remove(searchTab);
+    } catch (e) {}
+    searchTab = null;
+  }
+}
+
+function waitForTabLoad(tabId, timeout = 15000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    
+    const listener = (id, changeInfo) => {
+      if (id === tabId && changeInfo.status === 'complete' && !settled) {
+        settled = true;
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve(true);
+      }
+    };
+    
+    chrome.tabs.onUpdated.addListener(listener);
+    
+    // Timeout
+    setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve(false);
+      }
+    }, timeout);
+  });
+}
+
+// Handle tab removal
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (searchTab === tabId) {
+    searchTab = null;
+  }
+});
+
+// ═══════════════════════════════════════════════
+// CONTENT SCRIPT INJECTION
+// ═══════════════════════════════════════════════
+
+async function injectContentScript(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content-automation.js'],
+      world: 'MAIN'
+    });
+  } catch (e) {
+    // May already be injected, or page not ready
+  }
+}
+
+async function executeInTab(tabId, func, args = []) {
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId },
       func,
       args,
-      world: 'MAIN'  // Access page's JS context
-    });
-    return results?.[0]?.result;
-  } catch (e) {
-    console.error('Inject error:', e);
-    return null;
-  }
-}
-
-async function injectFile(tabId, file) {
-  try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId },
-      files: [file],
       world: 'MAIN'
     });
     return results?.[0]?.result;
   } catch (e) {
-    console.error('Inject file error:', e);
     return null;
   }
 }
 
-async function closeTab(tabId) {
-  try { await chrome.tabs.remove(tabId); } catch (e) {}
-}
-
-function isRewardsPageUrl(url) {
+// Execute in ISOLATED world (for API calls — has page cookies but no page JS interference)
+async function executeInTabIsolated(tabId, func, args = []) {
   try {
-    return new URL(url).hostname === 'rewards.bing.com';
-  } catch (e) {
-    return false;
-  }
-}
-
-async function getRewardsTab(url = 'https://rewards.bing.com/dashboard', active = false) {
-  const existingTabs = await chrome.tabs.query({ url: ['https://rewards.bing.com/*'] });
-  const reusableTab = existingTabs.find(t => t.active) || existingTabs[0];
-  if (reusableTab) {
-    return { tab: reusableTab, created: false };
-  }
-
-  const tab = await createTab(url, active);
-  return { tab, created: true };
-}
-
-async function fetchRewardsUserInfoQuiet() {
-  let tab = null;
-  let created = false;
-  const startTime = Date.now();
-  
-  try {
-    const rewardsTab = await getRewardsTab();
-    tab = rewardsTab.tab;
-    created = rewardsTab.created;
-    
-    // For new tabs, reload to ensure cookies are loaded
-    if (created) {
-      log('[API] New tab created, reloading to load cookies...', 'info');
-      await chrome.tabs.reload(tab.id);
-      await waitForTabLoad(tab.id).catch(() => {});
-    }
-    
-    await waitForTabLoad(tab.id).catch(() => {});
-    // 🔥 FIX: Increased wait time for nav/auth to fully load
-    // New tab: 6000ms (was 4000ms) → Allow cookies & session to load
-    // Existing tab: 2000ms (was 1000ms) → Allow any navigation to complete
-    await sleep(created ? 6000 : 2000);
-
-    const currentTab = await chrome.tabs.get(tab.id);
-    if (!isRewardsPageUrl(currentTab?.url)) {
-      if (created) await closeTab(tab.id);
-      log(`[API] ❌ Not on rewards.bing.com: ${currentTab?.url}`, 'warning', { 
-        endpoint: '/api/getuserinfo',
-        duration: Date.now() - startTime 
-      });
-      return {
-        ok: false,
-        reason: 'signin_required',
-        url: currentTab?.url || null
-      };
-    }
-
     const results = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: async () => {
-        try {
-          if (location.hostname !== 'rewards.bing.com') {
-            return {
-              ok: false,
-              reason: 'signin_required',
-              url: location.href
-            };
-          }
-
-          // ✅ NEW: Retry-enabled fetch with dynamic timeout
-          let lastError;
-          const maxRetries = 3;
-          
-          for (let attempt = 0; attempt <= maxRetries; attempt++) {
-            try {
-              const timeout = 12000 + (attempt * 3000); // Start at 12s, increase per retry
-              const controller = new AbortController();
-              const tid = setTimeout(() => controller.abort(), timeout);
-              
-              const apiUrl = new URL('/api/getuserinfo?type=1', location.origin).toString();
-              const attemptStartTime = Date.now();
-              console.log(`[API] Attempt ${attempt + 1}/${maxRetries + 1} (timeout: ${timeout}ms): ${apiUrl}`);
-              
-              const response = await fetch(apiUrl, {
-                signal: controller.signal,
-                cache: 'no-cache',
-                credentials: 'include',
-                headers: {
-                  'Accept': 'application/json',
-                  'X-Requested-With': 'XMLHttpRequest',
-                  // Force fresh request, ignore any cached auth
-                  'Pragma': 'no-cache'
-                }
-              });
-              clearTimeout(tid);
-              const duration = Date.now() - attemptStartTime;
-
-              if (!response.ok) {
-                // Don't retry auth errors on first attempt - allow retries after that
-                if ((response.status === 401 || response.status === 403) && attempt === 0) {
-                  // 🔥 FIX: For 401 on first attempt, try again after short wait
-                  // (page might still be loading session)
-                  if (attempt < maxRetries) {
-                    console.warn(`[API] Auth error on first attempt, retrying after delay...`);
-                    await new Promise(r => setTimeout(r, 2000));
-                    continue;
-                  } else {
-                    // After retries, this is a real auth error
-                    console.error(`[API] Auth error ${response.status} on attempt ${attempt + 1} (after retries)`);
-                    return {
-                      ok: false,
-                      reason: 'auth_error',
-                      status: response.status,
-                      url: apiUrl,
-                      duration
-                    };
-                  }
-                } else if (response.status === 401 || response.status === 403) {
-                  // Genuine auth failure
-                  console.error(`[API] Auth error ${response.status} on attempt ${attempt + 1}`);
-                  return {
-                    ok: false,
-                    reason: 'auth_error',
-                    status: response.status,
-                    url: apiUrl,
-                    duration
-                  };
-                }
-                
-                // Retry-able errors
-                if ((response.status >= 500 || response.status === 429) && attempt < maxRetries) {
-                  lastError = new Error(`HTTP_${response.status}`);
-                  const backoff = (attempt + 1) * 1500;
-                  console.warn(`[API] Retrying due to HTTP ${response.status}... (backoff: ${backoff}ms)`);
-                  await new Promise(r => setTimeout(r, backoff));
-                  continue;
-                }
-                
-                return {
-                  ok: false,
-                  reason: 'http_error',
-                  status: response.status,
-                  url: apiUrl,
-                  duration
-                };
-              }
-
-              const data = await response.json();
-              const totalDuration = Date.now() - startTime;
-              console.log(`[API] ✅ Success on attempt ${attempt + 1} (${duration}ms, total ${totalDuration}ms)`);
-              return { ok: true, data, url: apiUrl, duration, attempt: attempt + 1 };
-              
-            } catch (e) {
-              lastError = e;
-              const isTimeout = e.name === 'AbortError' || e.message.includes('timeout');
-              const duration = Date.now() - startTime;
-              
-              if (isTimeout && attempt < maxRetries) {
-                const backoff = (attempt + 1) * 2000;
-                console.warn(`[API] Timeout on attempt ${attempt + 1} (${duration}ms total), waiting ${backoff}ms before retry...`);
-                await new Promise(r => setTimeout(r, backoff));
-                continue;
-              }
-              
-              console.error(`[API] Error on attempt ${attempt + 1}: ${e.message}`);
-              if (attempt >= maxRetries) {
-                break;
-              }
-            }
-          }
-          
-          // All retries failed
-          return {
-            ok: false,
-            reason: 'fetch_failed',
-            error: lastError?.message || 'ALL_RETRIES_EXHAUSTED',
-            url: location.href,
-            attempts: maxRetries + 1,
-            duration: Date.now() - startTime
-          };
-          
-        } catch (e) {
-          return {
-            ok: false,
-            reason: 'script_error',
-            error: e?.message || String(e),
-            url: location.href,
-            duration: Date.now() - startTime
-          };
-        }
-      }
+      target: { tabId },
+      func,
+      args,
+      world: 'ISOLATED'
     });
-
-    const result = results?.[0]?.result;
-    
-    if (result?.ok) {
-      log(`[API] ✅ getuserinfo success (attempt ${result.attempt}, ${result.duration}ms)`, 'success', {
-        endpoint: '/api/getuserinfo',
-        duration: result.duration,
-        attempt: result.attempt,
-        totalTime: Date.now() - startTime,
-        status: 'OK',
-        tasksFound: result?.data?.dashboard?.dailySetPromotions ? 'yes' : 'unknown'
-      });
-    } else {
-      const reason = result?.reason || 'unknown';
-      const status = result?.status || '';
-      const error = result?.error || '';
-      const isCriticalAuth = reason === 'auth_error' && status === '401';
-      
-      log(`[API] ❌ getuserinfo failed: ${reason} ${status} ${error}`.trim(), isCriticalAuth ? 'warning' : 'error', {
-        endpoint: '/api/getuserinfo',
-        reason,
-        status,
-        attempts: result?.attempts || 1,
-        duration: Date.now() - startTime,
-        details: isCriticalAuth ? 'Session may not be loaded' : 'Check network/permissions'
-      });
-    }
-    
-    if (created) await closeTab(tab.id);
-    return result || { ok: false, reason: 'empty_result' };
+    return results?.[0]?.result;
   } catch (e) {
-    if (created && tab) await closeTab(tab.id);
-    log(`[API] ❌ Exception in fetchRewardsUserInfoQuiet: ${e.message}`, 'error', {
-      endpoint: '/api/getuserinfo',
-      error: e.message,
-      duration: Date.now() - startTime
-    });
-    return {
-      ok: false,
-      reason: 'fetch_failed',
-      error: e?.message || String(e)
-    };
+    return null;
   }
 }
 
-// ---- MOBILE MODE ----
-// Bật mobile mode: chọn random 1 device, cập nhật declarativeNetRequest + inject mobile-override.js
-const MOBILE_OVERRIDE_SCRIPT_ID = 'bra-mobile-override';
+// ═══════════════════════════════════════════════
+// MOBILE UA — DeclarativeNetRequest + Fingerprint
+// ═══════════════════════════════════════════════
 
-async function setMobileMode(enabled) {
+async function enableMobileUA(device) {
   try {
-    if (enabled) {
-      // Chọn device ngẫu nhiên từ pool
-      const device = (typeof getRandomMobileDevice === 'function')
-        ? getRandomMobileDevice()
-        : { name: 'iPhone 16 Pro Max', userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1', screenWidth: 393, screenHeight: 852, devicePixelRatio: 3 };
+    // Enable the static ruleset
+    await chrome.declarativeNetRequest.updateEnabledRulesets({
+      enableRulesetIds: ['mobile_ua_rules']
+    });
 
-      state.currentMobileDevice = device;
-      log(`📱 Mobile UA: ${device.name}`);
-
-      // Cập nhật header UA qua declarativeNetRequest
-      await chrome.declarativeNetRequest.updateDynamicRules({
-        removeRuleIds: [1001, 1002],
-        addRules: [
-          {
-            id: 1001, priority: 2,
-            action: {
-              type: 'modifyHeaders',
-              requestHeaders: [
-                { header: 'User-Agent', operation: 'set', value: device.userAgent },
-                { header: 'Sec-CH-UA-Mobile', operation: 'set', value: '?1' },
-                { header: 'Sec-CH-UA-Platform', operation: 'set', value: '"iOS"' },
-                { header: 'Sec-CH-UA', operation: 'remove' },
-                { header: 'Sec-CH-UA-Full-Version-List', operation: 'remove' }
-              ]
-            },
-            condition: {
-              urlFilter: '*://www.bing.com/*',
-              resourceTypes: ['main_frame', 'sub_frame', 'xmlhttprequest']
-            }
+    // Also add dynamic rule with the specific device UA
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: [100, 101],
+      addRules: [
+        {
+          id: 100,
+          priority: 2,
+          action: {
+            type: 'modifyHeaders',
+            requestHeaders: [{
+              header: 'User-Agent',
+              operation: 'set',
+              value: device.userAgent
+            }]
           },
-          {
-            id: 1002, priority: 2,
-            action: {
-              type: 'modifyHeaders',
-              requestHeaders: [
-                { header: 'User-Agent', operation: 'set', value: device.userAgent }
-              ]
-            },
-            condition: {
-              urlFilter: '*://rewards.bing.com/*',
-              resourceTypes: ['main_frame', 'sub_frame', 'xmlhttprequest']
-            }
+          condition: {
+            urlFilter: '*://www.bing.com/*',
+            resourceTypes: ['main_frame', 'sub_frame', 'xmlhttprequest', 'stylesheet', 'script', 'image']
           }
-        ]
-      });
-
-      // Inject mobile-override.js với device info cụ thể của device này
-      // Inject vào MAIN world để override navigator/screen/matchMedia
-      try {
-        await chrome.scripting.unregisterContentScripts({ ids: [MOBILE_OVERRIDE_SCRIPT_ID] });
-      } catch {} // Ignore nếu chưa có
-
-      // Inject device metadata trước khi chạy mobile-override.js
-      await chrome.scripting.registerContentScripts([{
-        id: MOBILE_OVERRIDE_SCRIPT_ID,
-        matches: ['*://*.bing.com/*'],
-        js: ['mobile-override.js'],
-        runAt: 'document_start',
-        world: 'MAIN',
-      }]);
-
-      // Fallback: enable static ruleset nếu có
-      await chrome.declarativeNetRequest.updateEnabledRulesets({
-        enableRulesetIds: ['mobile_ua_rules']
-      }).catch(() => {});
-
-      state.mobileRuleEnabled = true;
-      log(`📱 Full fingerprint spoofing active (${device.name})`, 'success');
-    } else {
-      // Xóa dynamic rules
-      await chrome.declarativeNetRequest.updateDynamicRules({
-        removeRuleIds: [1001, 1002]
-      });
-      await chrome.declarativeNetRequest.updateEnabledRulesets({
-        disableRulesetIds: ['mobile_ua_rules']
-      }).catch(() => {});
-
-      // Unregister content script
-      try {
-        await chrome.scripting.unregisterContentScripts({ ids: [MOBILE_OVERRIDE_SCRIPT_ID] });
-      } catch {}
-
-      state.mobileRuleEnabled = false;
-      state.currentMobileDevice = null;
-    }
-  } catch (e) {
-    console.error('Mobile mode toggle error:', e);
-  }
-}
-
-// ---- DAILY PROGRESS ----
-// Lưu tiến độ trong ngày vào chrome.storage để có thể track giữa các session
-async function getDailyProgress() {
-  const today = new Date().toISOString().slice(0, 10); // 'YYYY-MM-DD'
-  const result = await chrome.storage.local.get('dailyProgress');
-  const dp = result.dailyProgress;
-  // Reset nếu khác ngày
-  if (!dp || dp.date !== today) {
-    return { date: today, startPoints: null, currentPoints: null, earnedToday: 0, searchesDone: 0, cappedAt: null };
-  }
-  return dp;
-}
-
-async function saveDailyProgress(updates) {
-  const today = new Date().toISOString().slice(0, 10);
-  const current = await getDailyProgress();
-  const merged = { ...current, ...updates, date: today };
-  await chrome.storage.local.set({ dailyProgress: merged });
-  // Broadcast to UI
-  broadcast({ action: 'daily_progress', data: merged });
-  return merged;
-}
-
-async function updateDailyProgressAfterPoints(currentPoints) {
-  if (currentPoints === null) return;
-  const dp = await getDailyProgress();
-  const updates = { currentPoints };
-  // Set startPoints nếu chưa có (đầu ngày)
-  if (dp.startPoints === null) {
-    updates.startPoints = currentPoints;
-    updates.earnedToday = 0;
-  } else {
-    updates.earnedToday = Math.max(0, currentPoints - dp.startPoints);
-    updates.searchesDone = Math.round(updates.earnedToday / 5); // 5pts per search
-  }
-  return await saveDailyProgress(updates);
-}
-
-// ---- AUTOMATION: SEARCH ----
-async function performSearch(keyword, readResult = true) {
-  let tab = null;
-  let resultTab = null;
-  try {
-    // 1. Create tab → bing.com
-    tab = await createTab('https://www.bing.com', false);
-    await waitForTabLoad(tab.id);
-    await sleep(2000);
-
-    // 2. Inject automation script
-    await injectFile(tab.id, 'content-automation.js');
-    await sleep(500);
-
-    // 3. Type and search
-    const searchResult = await injectScript(tab.id, (kw) => {
-      return window.__BRA__?.typeAndSearch(kw);
-    }, [keyword]);
-
-    if (!searchResult?.success) {
-      await closeTab(tab.id);
-      return { success: false, error: 'search_failed' };
-    }
-
-    // 4. Wait for results page
-    await waitForTabLoad(tab.id).catch(() => {});
-    await sleep(1500);
-
-    // 5. Search interaction (scroll, hover — anti-ban)
-    await injectFile(tab.id, 'content-automation.js');
-    await sleep(300);
-    await injectScript(tab.id, () => {
-      return window.__BRA__?.enhancedSearchInteraction();
+        },
+        {
+          id: 101,
+          priority: 2,
+          action: {
+            type: 'modifyHeaders',
+            requestHeaders: [{
+              header: 'User-Agent',
+              operation: 'set',
+              value: device.userAgent
+            }]
+          },
+          condition: {
+            urlFilter: '*://rewards.bing.com/*',
+            resourceTypes: ['main_frame', 'sub_frame', 'xmlhttprequest']
+          }
+        }
+      ]
     });
 
-    // 6. Tab category switch (30% chance: Images / Videos / News)
-    await performTabCategorySwitch(tab.id);
-
-    // 7. Click vào 1 kết quả để simulate đọc thật (nếu được bật)
-    if (readResult) {
-      const resultUrl = await injectScript(tab.id, () => {
-        // Lấy link organic đầu tiên (không phải ad, không phải bing internal)
-        const candidates = Array.from(document.querySelectorAll('#b_results .b_algo h2 a[href], #b_results li.b_algo a[href]'))
-          .filter(a => {
-            try {
-              const url = new URL(a.href);
-              return url.hostname !== 'www.bing.com' && !a.href.includes('bing.com') && a.href.startsWith('http');
-            } catch { return false; }
-          });
-        return candidates.length > 0 ? candidates[Math.floor(Math.random() * Math.min(3, candidates.length))].href : null;
-      });
-
-      if (resultUrl) {
-        try {
-          resultTab = await createTab(resultUrl, false);
-          // Đọc bài trong 5-12 giây (random)
-          const readTime = randomInt(5000, 12000);
-          await sleep(readTime);
-          await closeTab(resultTab.id);
-          resultTab = null;
-        } catch (e) {
-          if (resultTab) { await closeTab(resultTab.id).catch(() => {}); resultTab = null; }
-        }
-      }
-    }
-
-    await closeTab(tab.id);
-    return { success: true, keyword };
-
-  } catch (e) {
-    if (resultTab) await closeTab(resultTab.id).catch(() => {});
-    if (tab) await closeTab(tab.id);
-    if (e.message === 'USER_STOPPED') throw e;
-    return { success: false, error: e.message };
-  }
-}
-
-// ---- AUTOMATION: MOBILE SEARCH PHASE ----
-// Chạy mobile search sau khi PC search xong (dùng dynamic UA spoofing)
-async function runMobileSearchPhase(count, config) {
-  if (count <= 0) return { done: 0 };
-
-  log(`📱 Mobile search phase: ${count} searches...`);
-  await setMobileMode(true); // Random pick device + apply dynamic rule
-  await sleep(1000);
-
-  const deviceName = state.currentMobileDevice?.name || 'Unknown';
-  log(`📱 Device: ${deviceName}`);
-
-  let mobileDone = 0;
-  for (let i = 0; i < count && state.status === 'running'; i++) {
-    const keyword = getRandomKeyword();
-    log(`📱 Mobile ${i + 1}/${count}: ${keyword}`);
-
-    let tab = null;
+    // Register mobile-override.js content script for fingerprint spoofing
     try {
-      tab = await createTab('https://www.bing.com', false);
-      await waitForTabLoad(tab.id);
-      await sleep(1500);
+      await chrome.scripting.unregisterContentScripts({ ids: ['mobile-override'] });
+    } catch (e) {}
 
-      await injectFile(tab.id, 'content-automation.js');
-      await sleep(400);
-
-      const res = await injectScript(tab.id, (kw) => window.__BRA__?.typeAndSearch(kw), [keyword]);
-      if (res?.success) {
-        await waitForTabLoad(tab.id).catch(() => {});
-        await sleep(1500);
-        mobileDone++;
-      }
-      await closeTab(tab.id);
-    } catch (e) {
-      if (tab) await closeTab(tab.id).catch(() => {});
-      if (e.message === 'USER_STOPPED') { await setMobileMode(false); throw e; }
+    // Inject mobile override variables before the page loads
+    if (searchTab) {
+      await chrome.scripting.executeScript({
+        target: { tabId: searchTab },
+        func: (ua, w, h, dpr) => {
+          window.__BRA_MOBILE_UA__ = ua;
+          window.__BRA_SCREEN_W__ = w;
+          window.__BRA_SCREEN_H__ = h;
+          window.__BRA_DPR__ = dpr;
+          window.__BRA_VENDOR__ = ua.includes('iPhone') ? 'Apple Computer, Inc.' : 'Google Inc.';
+          window.__BRA_PLATFORM__ = ua.includes('iPhone') ? 'iPhone' : 'Linux armv8l';
+          window.__BRA_MAX_TOUCH__ = 5;
+        },
+        args: [device.userAgent, device.width, device.height, device.deviceScaleFactor],
+        world: 'MAIN'
+      });
+      
+      await chrome.scripting.executeScript({
+        target: { tabId: searchTab },
+        files: ['mobile-override.js'],
+        world: 'MAIN'
+      });
     }
 
-    if (i < count - 1 && state.status === 'running') {
-      const delay = randomDelay(
-        Math.floor(config.minDelay * 0.6),
-        Math.floor(config.maxDelay * 0.6)
-      );
-      log(`📱 ⏳ ${Math.round(delay / 1000)}s...`);
-      await sleep(delay);
-    }
+    log(`📱 Mobile UA enabled: ${device.name}`, 'info');
+  } catch (e) {
+    log(`⚠️ Mobile UA setup error: ${e.message}`, 'warn');
   }
-
-  await setMobileMode(false);
-  log(`📱 Mobile done (${deviceName}): ${mobileDone}/${count}`, 'success');
-  return { done: mobileDone };
 }
 
-// ---- SILENT POINT CHECK (no tab open, just fetch) ----
-async function fetchPointsQuiet() {
-  let tab = null;
+async function disableMobileUA() {
   try {
-    tab = await createTab('https://rewards.bing.com/', false);
-    await waitForTabLoad(tab.id).catch(() => {});
-    await sleep(4000);
+    await chrome.declarativeNetRequest.updateEnabledRulesets({
+      disableRulesetIds: ['mobile_ua_rules']
+    });
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: [100, 101]
+    });
+    try {
+      await chrome.scripting.unregisterContentScripts({ ids: ['mobile-override'] });
+    } catch (e) {}
+    log('🖥️ Mobile UA disabled, back to PC', 'info');
+  } catch (e) {}
+}
 
-    const result = await injectScript(tab.id, () => {
-      return (async function() {
-        // METHOD 1: API (nhanh, chính xác) - WITH RETRY
-        try {
-          let lastError;
-          for (let attempt = 0; attempt <= 2; attempt++) {
-            try {
-              const timeout = 12000 + (attempt * 3000); // 12s, 15s, 18s
-              const controller = new AbortController();
-              const tid = setTimeout(() => controller.abort(), timeout);
-              const r = await fetch('https://rewards.bing.com/api/getuserinfo?type=1', {
-                signal: controller.signal, 
-                cache: 'no-cache', 
-                credentials: 'include',
-                headers: { 'Accept': 'application/json' }
-              });
-              clearTimeout(tid);
-              
-              if (r.ok) {
-                const data = await r.json();
-                const pts = data?.dashboard?.userStatus?.availablePoints;
-                if (typeof pts === 'number') return { points: pts, source: 'api' };
-              } else if (r.status >= 500 && attempt < 2) {
-                lastError = new Error(`HTTP ${r.status}`);
-                await new Promise(resolve => setTimeout(resolve, (attempt + 1) * 1500));
-                continue;
-              }
-            } catch (e) {
-              lastError = e;
-              if ((e.name === 'AbortError' || e.message.includes('timeout')) && attempt < 2) {
-                await new Promise(resolve => setTimeout(resolve, (attempt + 1) * 2000));
-                continue;
-              }
-            }
-          }
-        } catch (e) {}
+// ═══════════════════════════════════════════════
+// POINTS CHECK
+// ═══════════════════════════════════════════════
 
-        // METHOD 2: DOM selectors (fallback)
-        const extractNum = (text) => {
-          if (!text) return null;
-          const m = text.match(/(\d{1,3}(?:[,.\s]\d{3})+|\d+)/g);
-          if (m) {
-            const nums = m.map(x => parseInt(x.replace(/[,.\s]/g, ''), 10))
-              .filter(n => !isNaN(n) && n >= 0 && n < 1000000)
-              .sort((a, b) => b - a);
-            for (const n of nums) { if (n >= 100) return n; }
+async function scrapePointsFromAPI() {
+  // Strategy 1: Find an existing rewards.bing.com tab (same-origin fetch, no CORS)
+  try {
+    const rewardsTabs = await chrome.tabs.query({ url: ['*://rewards.bing.com/*', '*://rewards.microsoft.com/*'] });
+    for (const tab of rewardsTabs) {
+      try {
+        const pts = await executeInTabIsolated(tab.id, () => {
+          return fetch('/api/getuserinfo?type=1', { cache: 'no-cache', credentials: 'include' })
+            .then(r => r.ok ? r.json() : null)
+            .then(d => d?.dashboard?.userStatus?.availablePoints ?? null)
+            .catch(() => null);
+        });
+        if (pts !== null) return pts;
+      } catch (e) {}
+    }
+  } catch (e) {}
+
+  // Strategy 2: Scrape points from DOM on any Bing tab (no cross-origin fetch)
+  try {
+    const bingTabs = await chrome.tabs.query({ url: ['*://www.bing.com/*'] });
+    for (const tab of bingTabs) {
+      try {
+        const pts = await executeInTabIsolated(tab.id, () => {
+          const el = document.querySelector('#id_rc')
+            || document.querySelector('#id_rh')
+            || document.querySelector('[title*="point"]')
+            || document.querySelector('.points-container span');
+          if (el) {
+            const num = parseInt(el.textContent.replace(/[^0-9]/g, ''), 10);
+            if (!isNaN(num) && num > 0) return num;
           }
           return null;
-        };
-        const sels = [
-          '.text-title1.font-semibold', 'p.text-title1.font-semibold',
-          '.flex.items-center.gap-2 > p', '[class*="text-title1"]',
-          'mee-rewards-user-status-balance', '#balanceToolTip',
-          '.pointsValue', '[class*="balance"]'
-        ];
-        for (const sel of sels) {
-          try {
-            const el = document.querySelector(sel);
-            if (el) {
-              const n = extractNum(el.innerText || el.textContent);
-              if (n !== null) return { points: n, source: 'dom' };
-            }
-          } catch(e) {}
-        }
-        return { points: null, source: 'none' };
-      })();
-    });
-
-    await closeTab(tab.id);
-    return result || { points: null, source: 'error' };
-
-  } catch (e) {
-    if (tab) await closeTab(tab.id);
-    if (e.message === 'USER_STOPPED') throw e;
-    return { points: null, source: 'error', error: e.message };
-  }
-}
-
-// Record a point snapshot into history
-function recordPointSnapshot(points, wave, label) {
-  if (points === null) return;
-  const prevPoints = state.points.history.length > 0
-    ? state.points.history[state.points.history.length - 1].points
-    : state.points.baseline;
-  const delta = (prevPoints !== null && points !== null) ? points - prevPoints : null;
-
-  state.points.history.push({
-    time: new Date().toLocaleTimeString(),
-    points,
-    wave,
-    delta,
-    label
-  });
-
-  // Keep max 50 entries
-  if (state.points.history.length > 50) {
-    state.points.history = state.points.history.slice(-50);
-  }
-
-  state.points.current = points;
-  state.points.lastCheck = Date.now();
-
-  // Recalculate real earned from baseline
-  if (state.points.baseline !== null) {
-    state.points.earned = points - state.points.baseline;
-  }
-}
-
-// ---- AUTOMATION: SEARCH ALL (Wave System) ----
-async function startSearchAutomation(maxModeOverride = false) {
-  const config = await getConfig();
-  const tier = TIER_LIMITS[config.rewardsLevel] || TIER_LIMITS['gold'];
-
-  // Apply speed preset nếu có speedLevel
-  if (config.speedLevel && SPEED_PRESETS[config.speedLevel]) {
-    const preset = SPEED_PRESETS[config.speedLevel];
-    config.minDelay = preset.minDelay;
-    config.maxDelay = preset.maxDelay;
-    config.waveSize = preset.waveSize;
-    config.wavePauseMin = preset.wavePause;
-  }
-
-  const isMaxMode = maxModeOverride || config.maxMode;
-  const readResult = config.readResult !== false; // default true
-
-  // Tính số search cần chạy
-  let targetCount = Math.min(config.searchCount, tier.pcSearch);
-
-  // Max Mode: tính dựa trên điểm còn thiếu trong ngày
-  if (isMaxMode) {
-    const dp = await getDailyProgress();
-    if (dp.earnedToday >= tier.dailyPointCap) {
-      log(`🏆 Max Mode: Đã đủ điểm hôm nay! (${dp.earnedToday}/${tier.dailyPointCap} pts)`, 'success');
-      broadcast({ action: 'daily_progress', data: dp });
-      return;
-    }
-    const ptsLeft = tier.dailyPointCap - dp.earnedToday;
-    const searchesLeft = Math.ceil(ptsLeft / 5); // 5pts/search
-    targetCount = Math.min(searchesLeft, tier.pcSearch);
-    log(`⚡ Max Mode: Cần thêm ~${ptsLeft} pts → chạy ${targetCount} searches`);
-  }
-
-  const waveSize = config.waveSize || 5;
-  const totalWaves = Math.ceil(targetCount / waveSize);
-
-  state.status = 'running';
-  state._startTime = Date.now(); // Để tính duration
-  state.currentSearch = 0;
-  state.totalSearches = targetCount;
-  state.progress = `0/${targetCount}`;
-  state.percent = 0;
-  state.wave = { current: 1, total: totalWaves };
-  broadcastState();
-
-  const modeLabel = isMaxMode ? 'MAX MODE' : config.rewardsLevel.toUpperCase();
-  log(`▶️ Started (${modeLabel} — ${targetCount} PC searches, ${totalWaves} waves${readResult ? ' + read' : ''})`);
-
-  // ====== BASELINE: Check points BEFORE starting ======
-  log('📊 Checking points before starting...');
-  const baseline = await fetchPointsQuiet();
-  if (baseline.points !== null) {
-    state.points.baseline = baseline.points;
-    state.points.current = baseline.points;
-    state.points.earned = 0;
-    state.points.history = [];
-    recordPointSnapshot(baseline.points, 0, 'baseline');
-    log(`📊 Baseline: ${baseline.points.toLocaleString()} pts`, 'success');
-    // Cập nhật daily progress
-    await updateDailyProgressAfterPoints(baseline.points);
-  } else {
-    log('⚠️ Could not read baseline points', 'warning');
-    state.points.baseline = null;
-    state.points.earned = 0;
-  }
-  broadcastState();
-
-  // ---- TIME-OF-DAY PROFILE ----
-  const timeProfile = getTimeOfDayProfile();
-  const timedConfig  = applyTimeProfile(config);
-  log(`🕐 Time profile: ${timeProfile.label} (delay ×${timeProfile.activityMult})`);
-
-  // ---- COFFEE BREAK SETUP ----
-  let coffeeBreakAt      = getNextCoffeeBreak();
-  let searchesSinceBreak = 0;
-  log(`☕ Coffee break mỗi ${coffeeBreakAt} search`);
-
-  let completed = 0;
-  let consecutiveZeroWaves = 0; // đếm wave 0 điểm liên tiếp → phát hiện daily cap
-
-  for (let wave = 1; wave <= totalWaves && state.status === 'running'; wave++) {
-    state.wave.current = wave;
-    const waveStart = completed;
-    const waveEnd = Math.min(completed + waveSize, targetCount);
-
-    log(`🌊 Wave ${wave}/${totalWaves} (${waveStart + 1}-${waveEnd}/${targetCount})`);
-    broadcastState();
-
-    for (let i = waveStart; i < waveEnd && state.status === 'running'; i++) {
-      const keyword = getRandomKeyword();
-      log(`🔍 Search ${i + 1}/${targetCount}: ${keyword}`);
-
-      let result = await performSearch(keyword, readResult);
-
-      // Retry if failed
-      if (!result.success) {
-        for (let retry = 0; retry < (config.maxRetries || 2) && !result.success; retry++) {
-          const retryKeyword = getRandomKeyword();
-          log(`🔄 Retry ${retry + 1}: ${retryKeyword}`, 'warning');
-          await sleep(5000);
-          result = await performSearch(retryKeyword, false); // retry không cần readResult
-        }
-      }
-
-      if (result.success) {
-        completed++;
-        state.currentSearch = completed;
-        state.progress = `${completed}/${targetCount}`;
-        state.percent = Math.floor((completed / targetCount) * 100);
-        broadcastState();
-      } else {
-        log(`❌ Search failed: ${result.error}`, 'error');
-      }
-
-      searchesSinceBreak++;
-
-      // ---- COFFEE BREAK ----
-      if (searchesSinceBreak >= coffeeBreakAt && state.status === 'running') {
-        const isLongBreak  = coffeeBreakAt > 9;
-        const breakSec     = isLongBreak
-          ? randomInt(45, 90)
-          : randomInt(15, 30);
-        log(`☕ ${isLongBreak ? 'Nghỉ dài' : 'Nghỉ ngắn'}: ${breakSec}s...`, 'info');
-        await sleep(breakSec * 1000);
-        coffeeBreakAt      = getNextCoffeeBreak();
-        searchesSinceBreak = 0;
-        log(`☕ Tiếp tục — break tiếp theo sau ${coffeeBreakAt} search`);
-      }
-
-      // Delay giữa searches (không delay sau search cuối trong wave)
-      if (state.status === 'running' && i < waveEnd - 1) {
-        const delay = randomDelay(timedConfig.minDelay, timedConfig.maxDelay);
-        log(`⏳ ${Math.round(delay / 1000)}s...`);
-        await sleep(delay);
-      }
-    }
-
-    // ====== AFTER WAVE: Verify points ======
-    if (state.status === 'running' || state.status === 'cooldown') {
-      log(`📊 Wave ${wave} done — checking points...`);
-      await sleep(2500);
-      const afterWave = await fetchPointsQuiet();
-      if (afterWave.points !== null) {
-        const prevPoints = state.points.current;
-        recordPointSnapshot(afterWave.points, wave, `after_wave_${wave}`);
-        await updateDailyProgressAfterPoints(afterWave.points);
-        const waveDelta = (prevPoints !== null) ? afterWave.points - prevPoints : null;
-
-        if (waveDelta !== null && waveDelta > 0) {
-          consecutiveZeroWaves = 0;
-          log(`📊 Wave ${wave}: +${waveDelta} pts ✅ (hôm nay: +${state.points.earned})`, 'success');
-        } else if (waveDelta === 0) {
-          consecutiveZeroWaves++;
-          log(`⚠️ Wave ${wave}: 0 pts — ${consecutiveZeroWaves} wave liên tiếp không lên điểm`, 'warning');
-          // Dừng sớm nếu 2 wave liên tiếp không lên — đã đạt daily cap
-          if (isMaxMode && consecutiveZeroWaves >= 2) {
-            log('🏆 Đã đạt giới hạn điểm hôm nay! Dừng an toàn.', 'success');
-            break;
-          }
-        } else {
-          log(`📊 Wave ${wave}: ${afterWave.points.toLocaleString()} pts`);
-        }
-      } else {
-        log(`⚠️ Wave ${wave}: Không check được điểm`, 'warning');
-      }
-      broadcastState();
-    }
-
-    // Wave pause (trừ wave cuối)
-    if (wave < totalWaves && state.status === 'running') {
-      const pauseMin = config.wavePauseMin || 8;
-      // Thêm jitter nhỏ (±30s) thay vì cố định
-      const jitter = randomInt(-30000, 30000);
-      const pauseMs = pauseMin * 60 * 1000 + jitter;
-      state.status = 'cooldown';
-      log(`😴 Wave pause ${pauseMin}min... (wave ${wave + 1}/${totalWaves} sắp bắt đầu)`, 'warning');
-      broadcastState();
-      await sleep(pauseMs);
-      if (state.status === 'cooldown') state.status = 'running';
-    }
-  }
-
-  // ====== MOBILE SEARCH PHASE ======
-  if (state.status === 'running' && config.mobileMode && tier.mobileSearch > 0) {
-    log(`📱 Bắt đầu Mobile search phase...`);
-    let mobileTarget = tier.mobileSearch;
-
-    if (isMaxMode) {
-      const dp = await getDailyProgress();
-      if (dp.earnedToday >= tier.dailyPointCap) {
-        log('🏆 Max Mode: Đã đủ điểm — bỏ qua mobile phase', 'success');
-        mobileTarget = 0;
-      } else {
-        const ptsLeft = tier.dailyPointCap - dp.earnedToday;
-        mobileTarget = Math.min(Math.ceil(ptsLeft / 5), tier.mobileSearch);
-        log(`📱 Max Mode mobile: cần ${mobileTarget} searches`);
-      }
-    }
-
-    if (mobileTarget > 0) {
-      const mobileDone = await runMobileSearchPhase(mobileTarget, config);
-
-      // Update daily progress sau mobile
-      await sleep(3000);
-      const afterMobile = await fetchPointsQuiet();
-      if (afterMobile.points !== null) {
-        recordPointSnapshot(afterMobile.points, totalWaves + 1, 'after_mobile');
-        await updateDailyProgressAfterPoints(afterMobile.points);
-        log(`📱 Mobile done: +${afterMobile.points - (state.points.current || afterMobile.points)} pts`, 'success');
-      }
-    }
-  }
-
-  // ====== FINAL: Summary ======
-  if (state.status === 'running' || state.status === 'cooldown') {
-    state.status = 'done';
-    state.percent = 100;
-
-    log('📊 Final check...');
-    const final = await fetchPointsQuiet();
-    let totalEarned = null;
-
-    if (final.points !== null) {
-      recordPointSnapshot(final.points, totalWaves + 1, 'final');
-      await updateDailyProgressAfterPoints(final.points);
-      totalEarned = state.points.baseline !== null ? final.points - state.points.baseline : null;
-
-      if (totalEarned !== null) {
-        state.points.earned = totalEarned;
-        log(`✅ Done! ${completed}/${targetCount} searches — +${totalEarned} pts earned`, 'success');
-        if (totalEarned === 0) log('⚠️ 0 điểm — có thể đã đạt giới hạn ngày hoặc search không được tính', 'warning');
-      } else {
-        log(`✅ Done! ${completed}/${targetCount} searches`, 'success');
-      }
-    } else {
-      log(`✅ Done! ${completed}/${targetCount} searches`, 'success');
-    }
-
-    // ====== OPEN done.html ======
-    try {
-      const durationSec = Math.round((Date.now() - (state._startTime || Date.now())) / 1000);
-      const searchMode  = config.mobileMode ? 'both' : 'desktop';
-      const doneUrl = chrome.runtime.getURL(
-        `done.html?searches=${completed}&earned=${totalEarned || 0}&duration=${durationSec}&mode=${searchMode}&timeProfile=${timeProfile.name}`
-      );
-      await chrome.tabs.create({ url: doneUrl, active: true });
-    } catch (e) {
-      log('⚠️ Không mở được done.html', 'warning');
-    }
-  }
-  broadcastState();
-}
-
-// ---- AUTOMATION: CHECK POINTS (manual button) ----
-async function checkPoints() {
-  let tab = null;
-  try {
-    log('⭐ Checking points...');
-    tab = await createTab('https://rewards.bing.com/', false);
-    await waitForTabLoad(tab.id);
-    await sleep(5000);
-
-    const result = await injectScript(tab.id, () => {
-      return (async function() {
-        let result = { points: null, status: 'UNKNOWN', breakdown: null };
-
-        // BAN DETECTION
-        const bodyText = document.body?.innerText || '';
-        if (bodyText.match(/suspended|tạm ngưng|bị khóa|vi phạm/i)) {
-          result.status = 'BANNED';
-          return result;
-        }
-
-        // METHOD 1: Full API (lấy cả breakdown) - WITH RETRY
-        try {
-          let lastError;
-          for (let attempt = 0; attempt <= 2; attempt++) {
-            try {
-              const timeout = 12000 + (attempt * 3000);
-              const controller = new AbortController();
-              const tid = setTimeout(() => controller.abort(), timeout);
-              const r = await fetch('https://rewards.bing.com/api/getuserinfo?type=1', {
-                signal: controller.signal,
-                cache: 'no-cache',
-                credentials: 'include',
-                headers: { 'Accept': 'application/json' }
-              });
-              clearTimeout(tid);
-              
-              if (r.ok) {
-                const data = await r.json();
-                const us = data?.dashboard?.userStatus;
-                if (us) {
-                  result.points = us.availablePoints;
-                  result.status = 'OK';
-                  // Lấy thêm thông tin breakdown nếu có
-                  result.breakdown = {
-                    available: us.availablePoints,
-                    lifetime: us.lifetimePoints || null,
-                    redeemable: us.redeemablePoints || null,
-                    level: us.levelInfo?.activeLevel || null
-                  };
-                  // Lấy counters (PC search, mobile search, edge bonus)
-                  const counters = data?.dashboard?.userStatus?.counters;
-                  if (counters) {
-                    result.breakdown.counters = {};
-                    for (const [key, val] of Object.entries(counters)) {
-                      if (val?.complete !== undefined && val?.pointProgress !== undefined) {
-                        result.breakdown.counters[key] = {
-                          progress: val.pointProgress,
-                          max: val.pointProgressMax,
-                          complete: val.complete
-                        };
-                      }
-                    }
-                  }
-                  return result;
-                }
-              } else if (r.status >= 500 && attempt < 2) {
-                lastError = new Error(`HTTP ${r.status}`);
-                await new Promise(resolve => setTimeout(resolve, (attempt + 1) * 1500));
-                continue;
-              }
-            } catch (e) {
-              lastError = e;
-              if ((e.name === 'AbortError' || e.message.includes('timeout')) && attempt < 2) {
-                await new Promise(resolve => setTimeout(resolve, (attempt + 1) * 2000));
-                continue;
-              }
-            }
-          }
-        } catch (e) {}
-
-        // METHOD 2: DOM selectors (fallback)
-        const extractPoints = (text) => {
-          if (!text) return null;
-          const matches = text.match(/(\d{1,3}(?:[,.\s]\d{3})+|\d+)/g);
-          if (matches) {
-            const nums = matches.map(m => parseInt(m.replace(/[,.\s]/g, ''), 10))
-              .filter(n => !isNaN(n) && n >= 0 && n < 1000000)
-              .sort((a, b) => b - a);
-            for (const n of nums) { if (n >= 100) return n; }
-          }
-          return null;
-        };
-
-        const selectors = [
-          '.text-title1.font-semibold',
-          'p.text-title1.font-semibold',
-          '.flex.items-center.gap-2 > p',
-          '[class*="text-title1"]',
-          'mee-rewards-user-status-balance',
-          '#balanceToolTip',
-          '.pointsValue',
-          '[class*="balance"]'
-        ];
-
-        for (const sel of selectors) {
-          try {
-            const el = document.querySelector(sel);
-            if (el) {
-              const num = extractPoints(el.innerText || el.textContent);
-              if (num !== null) {
-                result.points = num;
-                result.status = 'OK';
-                return result;
-              }
-            }
-          } catch(e) {}
-        }
-
-        return result;
-      })();
-    });
-
-    await closeTab(tab.id);
-
-    if (result?.status === 'BANNED') {
-      state.status = 'error';
-      log('🚫 ACCOUNT BANNED / SUSPENDED!', 'error');
-    } else if (result?.status === 'OK' && result.points !== null) {
-      // Update state with real data
-      const prevPoints = state.points.current;
-      state.points.current = result.points;
-      state.points.lastCheck = Date.now();
-
-      // If we have a baseline, show real earned
-      if (state.points.baseline !== null) {
-        state.points.earned = result.points - state.points.baseline;
-        log(`⭐ Points: ${result.points.toLocaleString()} (earned: +${state.points.earned} since baseline)`, 'success');
-      } else {
-        // No baseline yet — set this as baseline
-        state.points.baseline = result.points;
-        state.points.earned = 0;
-        log(`⭐ Points: ${result.points.toLocaleString()} (set as baseline)`, 'success');
-      }
-
-      // Show delta since last check
-      if (prevPoints !== null && prevPoints !== result.points) {
-        const delta = result.points - prevPoints;
-        log(`   Δ ${delta > 0 ? '+' : ''}${delta} since last check`);
-      }
-
-      // Show breakdown if available
-      if (result.breakdown?.counters) {
-        for (const [key, val] of Object.entries(result.breakdown.counters)) {
-          const name = key.replace(/([A-Z])/g, ' $1').trim();
-          const pct = val.max > 0 ? Math.round((val.progress / val.max) * 100) : 0;
-          log(`   📈 ${name}: ${val.progress}/${val.max} (${pct}%) ${val.complete ? '✅' : ''}`);
-        }
-      }
-
-      recordPointSnapshot(result.points, state.wave.current, 'manual_check');
-    } else {
-      log('⚠️ Could not read points (API + DOM both failed)', 'warning');
-    }
-    broadcastState();
-
-  } catch (e) {
-    if (tab) await closeTab(tab.id);
-    log(`❌ Points check failed: ${e.message}`, 'error');
-  }
-}
-
-// ---- AUTOMATION: DAILY TASKS ----
-function normalizeRewardsTaskUrl(url) {
-  if (typeof url !== 'string' || !url.trim()) return null;
-
-  try {
-    const parsed = new URL(url, 'https://rewards.bing.com');
-    parsed.hash = '';
-    return parsed.toString();
-  } catch (e) {
-    return url.trim();
-  }
-}
-
-function buildRewardsTaskKey(task) {
-  if (!task || typeof task !== 'object') return null;
-
-  const offerId = task.offerId || task.offerid || task.promotionId || task.id || '';
-  const destinationUrl = normalizeRewardsTaskUrl(task.destinationUrl) || '';
-
-  if (!offerId && !destinationUrl) return null;
-  return `offer:${offerId}|url:${destinationUrl}`;
-}
-
-function extractPendingRewardsTasks(apiData) {
-  const pending = new Map();
-  const dashboard = apiData?.dashboard || {};
-
-  const addTask = (task, section) => {
-    if (!task || typeof task !== 'object' || task.activity) return;
-
-    const destinationUrl = normalizeRewardsTaskUrl(task.destinationUrl);
-    if (!destinationUrl || destinationUrl.includes('referandearn')) return;
-    if (task.complete || task.pointProgressMax) return;
-
-    const key = buildRewardsTaskKey(task);
-    if (!key || pending.has(key)) return;
-
-    pending.set(key, {
-      key,
-      section,
-      title: task.title || task.name || task.description || destinationUrl,
-      destinationUrl,
-      offerId: task.offerId || task.offerid || task.promotionId || task.id || null
-    });
-  };
-
-  const addFromArray = (tasks, section) => {
-    if (!Array.isArray(tasks)) return;
-    for (const task of tasks) addTask(task, section);
-  };
-
-  const addFromSection = (section, sectionName) => {
-    if (!section || typeof section !== 'object') return;
-
-    if (Array.isArray(section)) {
-      addFromArray(section, sectionName);
-      return;
-    }
-
-    for (const [key, value] of Object.entries(section)) {
-      if (Array.isArray(value)) {
-        addFromArray(value, `${sectionName}.${key}`);
-        continue;
-      }
-
-      if (!value || typeof value !== 'object') continue;
-
-      if (Array.isArray(value.default)) {
-        addFromArray(value.default, `${sectionName}.${key}.default`);
-      }
-
-      for (const [nestedKey, nestedValue] of Object.entries(value)) {
-        if (Array.isArray(nestedValue)) {
-          addFromArray(nestedValue, `${sectionName}.${key}.${nestedKey}`);
-        }
-      }
-    }
-  };
-
-  addFromSection(dashboard.dailySetPromotions, 'dailySetPromotions');
-  addFromSection(dashboard.morePromotions, 'morePromotions');
-
-  if (Array.isArray(dashboard.punchCards)) {
-    dashboard.punchCards.forEach((punchCard, index) => {
-      addFromArray(punchCard?.activities, `punchCards.${index}.activities`);
-      addFromArray(punchCard?.parentPromotion, `punchCards.${index}.parentPromotion`);
-      addFromArray(punchCard?.parentPromotion?.promotions, `punchCards.${index}.parentPromotion.promotions`);
-    });
-  }
-
-  return {
-    pending,
-    pendingCount: pending.size,
-    urls: [...new Set([...pending.values()].map(task => task.destinationUrl).filter(Boolean))]
-  };
-}
-
-function compareRewardsTaskSnapshots(beforeSnapshot, afterSnapshot) {
-  const beforePending = beforeSnapshot?.pending || new Map();
-  const afterPending = afterSnapshot?.pending || new Map();
-  const completed = [];
-  const remaining = [];
-
-  for (const [key, task] of beforePending.entries()) {
-    if (!afterPending.has(key)) completed.push(task);
-  }
-
-  for (const [key, task] of afterPending.entries()) {
-    if (beforePending.has(key)) remaining.push(task);
-  }
-
-  return {
-    completed,
-    completedCount: completed.length,
-    remaining,
-    remainingCount: remaining.length,
-    beforeCount: beforePending.size,
-    afterCount: afterPending.size
-  };
-}
-
-async function verifyDailyTaskCompletion(initialSnapshot, options = {}) {
-  const { maxAttempts = 4, delayMs = 4000 } = options;
-  let bestResult = null;
-
-  if (!initialSnapshot?.pending) {
-    return { ok: false, reason: 'initial_snapshot_missing' };
-  }
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    if (attempt > 1) {
-      await sleep(delayMs);
-    }
-
-    const apiResult = await fetchRewardsUserInfoQuiet();
-    if (!apiResult?.ok) {
-      if (!bestResult) {
-        bestResult = {
-          ok: false,
-          reason: apiResult?.reason || 'api_unavailable'
-        };
-      }
-      continue;
-    }
-
-    const afterSnapshot = extractPendingRewardsTasks(apiResult.data);
-    const diff = compareRewardsTaskSnapshots(initialSnapshot, afterSnapshot);
-    const currentResult = {
-      ok: true,
-      attempt,
-      snapshot: afterSnapshot,
-      ...diff
-    };
-
-    if (
-      !bestResult ||
-      !bestResult.ok ||
-      currentResult.completedCount > bestResult.completedCount ||
-      currentResult.afterCount < bestResult.afterCount
-    ) {
-      bestResult = currentResult;
-    }
-
-    if (currentResult.completedCount > 0 || currentResult.afterCount === 0) {
-      break;
-    }
-  }
-
-  return bestResult || { ok: false, reason: 'api_unavailable' };
-}
-
-async function runDailyTasks() {
-  log(`[Daily Tasks] Bắt đầu tự động làm nhiệm vụ hàng ngày...`);
-  let dashTab = null;
-  let dashTabOwned = false;
-  let totalCompleted = 0;
-  let apiUrls = [];
-  let initialTaskSnapshot = null;
-  let dashboardClickAttempts = 0;
-  let externalUrlsProcessed = 0;
-
-  try {
-    // 🔥 TẢI DỮ LIỆU SUPER ACCURATE JSON QUA API
-    log('🤖 [API] Đang tải Database JSON cực kỳ chính xác từ Microsoft Server...');
-    const apiResult = await fetchRewardsUserInfoQuiet();
-    if (apiResult?.ok) {
-      initialTaskSnapshot = extractPendingRewardsTasks(apiResult.data);
-      apiUrls = initialTaskSnapshot.urls;
-      log(`[API] Pending Rewards tasks from getuserinfo: ${initialTaskSnapshot.pendingCount}`, 'info', {
-        pending: initialTaskSnapshot.pendingCount,
-        urls: apiUrls.length
-      });
-
-      if (initialTaskSnapshot.pendingCount === 0) {
-        log('[API] No pending Rewards tasks found. Skipping dashboard clicks to avoid false positives.', 'info');
-        return { success: true, completed: 0 };
-      }
-
-      const dbData = apiResult.data;
-      const dashboard = dbData.dashboard || {};
-
-      const isValidTask = (task) => {
-        if (!task || typeof task !== 'object') return false;
-        if (task.activity) return false; // skip meta wrappers
-        return task.destinationUrl && !task.destinationUrl.includes('referandearn');
-      };
-
-      const extractFromArray = (arr) => {
-        if (!Array.isArray(arr)) return;
-        for (const task of arr) {
-          if (isValidTask(task) && !task.complete && !task.pointProgressMax) {
-            apiUrls.push(task.destinationUrl);
-          }
-        }
-      };
-
-      // Extract tasks from API object structures (dailySetPromotions is {date: {default: [...]}}, etc.)
-      const extractFromSection = (obj) => {
-        if (!obj || typeof obj !== 'object') return;
-        if (Array.isArray(obj)) {
-          // some sections are direct arrays
-          extractFromArray(obj);
-          return;
-        }
-        for (const val of Object.values(obj)) {
-          if (Array.isArray(val)) {
-            extractFromArray(val);
-          } else if (typeof val === 'object' && val !== null) {
-            // drill one level deeper (e.g. { "default": [...] })
-            extractFromArray(val.default || val);
-          }
-        }
-      };
-
-      // 1. Quét Daily Set (keyed: {dateKey: {default: [tasks]}})
-      if (dashboard.dailySetPromotions) {
-        extractFromSection(dashboard.dailySetPromotions);
-      }
-      // 2. Quét More Promotions
-      if (dashboard.morePromotions) {
-        extractFromSection(dashboard.morePromotions);
-      }
-      // 3. Quét PunchCards
-      if (dashboard.punchCards && Array.isArray(dashboard.punchCards)) {
-        for (const pc of dashboard.punchCards) {
-          if (pc.activities && Array.isArray(pc.activities)) {
-            extractFromArray(pc.activities);
-          }
-          if (pc.parentPromotion) {
-            if (Array.isArray(pc.parentPromotion)) {
-              extractFromArray(pc.parentPromotion);
-            } else if (Array.isArray(pc.parentPromotion.promotions)) {
-              extractFromArray(pc.parentPromotion.promotions);
-            }
-          }
-        }
-      }
-
-      // Khử trùng lặp URL
-      apiUrls = [...new Set(apiUrls)];
-      log(`🔥 [API] Thành công! Tìm thấy chính xác ${apiUrls.length} nhiệm vụ cần làm.`);
-    } else if (apiResult?.reason === 'signin_required') {
-      log('Rewards is not signed in. Open rewards.bing.com, sign in, then run Daily Tasks again.', 'warning');
-      return { success: false, completed: totalCompleted, error: 'signin_required' };
-    } else {
-      const detail = apiResult?.status || apiResult?.error || apiResult?.reason || 'unknown_error';
-      log(`[API] Rewards JSON unavailable (${detail}). Continuing with dashboard mode only.`, 'warning');
-    }
-  } catch (e) {
-    log(`[API Error] Lỗi khi kéo Database: ${e.message}`, 'error');
-  }
-
-  try {
-    // 🔥 PHASE 1: DIRECT API / SERVER ACTIONS (Super Fast)
-    log('🤖 [API] Đang thực hiện nhiệm vụ bằng Server Actions (Direct)...');
-    const rewardsTab = await getRewardsTab();
-    dashTab = rewardsTab.tab;
-    dashTabOwned = rewardsTab.created;
-    await waitForTabLoad(dashTab.id).catch(() => {});
-    await sleep(dashTabOwned ? 5000 : 1000);
-
-    const dashTabInfo = await chrome.tabs.get(dashTab.id);
-    if (!isRewardsPageUrl(dashTabInfo?.url)) {
-      if (dashTabOwned) await closeTab(dashTab.id);
-      log('Rewards dashboard redirected away from rewards.bing.com. Sign in first, then retry.', 'warning');
-      return { success: false, completed: totalCompleted, error: 'signin_required' };
-    }
-
-    // Inject automation script
-    await injectFile(dashTab.id, 'content-automation.js');
-    await sleep(500);
-
-    // 🔥 DEBUG: Verify script was injected
-    const injectionTest = await injectScript(dashTab.id, () => {
-      return typeof window.__BRA__?.clickDailyTasks === 'function' ? 'injected' : 'missing';
-    });
-    log(`[DEBUG] Dashboard automation injected: ${injectionTest}`, 'info');
-
-    // Run the hybrid clicker (Direct API + DOM Fallback)
-    const result = await injectScript(dashTab.id, () => {
-      return window.__BRA__?.clickDailyTasks?.();
-    });
-
-    // 🔥 FIX: Better validation of result
-    const clickedCount = result?.clicked || 0;
-    const attemptedCount = result?.attempted || 0;
-    const clickedUrls = result?.urls || [];
-    dashboardClickAttempts = clickedCount;
-    const clickSuccess = false; // Raw clicks are attempts only; API snapshot decides completion.
-
-    if (clickSuccess) {
-      // Real success - actually clicked tasks
-      log(`🔥 ✅ Thành công! Đã click ${clickedCount}/${attemptedCount} task(s)`, 'success', {
-        clicked: clickedCount,
-        attempted: attemptedCount,
-        urls: clickedUrls.slice(0, 3) // Log first 3 URLs as proof
-      });
-      totalCompleted += clickedCount;
-    } else if (clickedCount > 0 && !clickSuccess) {
-      // Dashboard clicks are only attempts until API snapshot confirms task completion.
-      log(`⚠️ Click result unclear: reported ${clickedCount} clicked but success=${result?.success}`, 'warning', {
-        clicked: clickedCount,
-        attempted: attemptedCount,
-        urls: clickedUrls.slice(0, 3)
-      });
-    } else {
-      // No tasks clicked
-      const reason = result?.error ? `(${result.error})` : '(không tìm thấy tasks hoặc đã làm xong)';
-      log(`⚠️ Không click được nhiệm vụ nào trên Dashboard ${reason}`, 'warning', {
-        attemptedCount,
-        error: result?.error
-      });
-    }
-    
-    // Log raw result for debugging
-    console.log('[Dashboard Tasks Result]', result);
-    
-    await sleep(2000);
-    if (dashTabOwned) {
-      await closeTab(dashTab.id);
-      dashTab = null;
-      dashTabOwned = false;
-    }
-
-    // 🔥 PHASE 2: FALLBACK TO EXTERNAL URLS (from getuserinfo API)
-    if (apiUrls.length > 0) {
-      log(`[API Fallback] Attempting ${apiUrls.length} external URL tasks...`, 'info');
-      let urlsProcessed = 0;
-      
-      for (const url of apiUrls) {
-        let taskTab = null;
-        try {
-          if (url.includes('microsoft.com/en-us/edge') || url.includes('bing.com/explore')) {
-            log(`[API Fallback] Skipping edge redirect: ${url.substring(0, 40)}...`, 'info');
-            continue;
-          }
-
-          log(`[API Fallback] Opening external task (${urlsProcessed + 1}/${apiUrls.length}): ${url.substring(0, 50)}...`, 'info');
-          taskTab = await createTab(url, false);
-          await waitForTabLoad(taskTab.id).catch(() => {});
-          await sleep(4000);
-
-          // Try to dismiss popups
-          await injectScript(taskTab.id, () => {
-            window.alert = () => { }; 
-            window.confirm = () => false; 
-            window.prompt = () => null;
-            const cancels = document.querySelectorAll('button[class*="cancel"], button[class*="close"]');
-            cancels.forEach(c => { try { c.click(); } catch (e) { } });
-          }).catch(() => {});
-
-          await sleep(1500);
-          await closeTab(taskTab.id);
-          urlsProcessed++;
-          externalUrlsProcessed++;
-          // Note: Not incrementing totalCompleted here - we don't know if task was actually completed
-          log(`[API Fallback] Task tab processed (${urlsProcessed}/${apiUrls.length})`, 'info');
-          
-        } catch (e) {
-          log(`[API Fallback] Error on task: ${e.message}`, 'warning');
-          if (taskTab) await closeTab(taskTab.id).catch(() => {});
-        }
-      }
-      
-      // Only log fallback as completed if we processed URLs
-      if (urlsProcessed > 0) {
-        log(`[API Fallback] Processed ${urlsProcessed} external task URLs (may or may not result in points)`, 'info', {
-          processed: urlsProcessed,
-          total: apiUrls.length
         });
-        // Don't add to totalCompleted - we can't verify these actually completed
-      }
+        if (pts !== null) return pts;
+      } catch (e) {}
     }
+  } catch (e) {}
 
-    if (dashTabOwned && dashTab) {
-      const remaining = await chrome.tabs.query({ windowType: 'normal' });
-      if (remaining.length > 1) await closeTab(dashTab.id);
-    }
-    dashTab = null;
-    dashTabOwned = false;
-
-    const attemptedAnyTask = dashboardClickAttempts > 0 || externalUrlsProcessed > 0;
-    if (initialTaskSnapshot) {
-      const verification = await verifyDailyTaskCompletion(initialTaskSnapshot, {
-        maxAttempts: attemptedAnyTask ? 4 : 1,
-        delayMs: 4000
-      });
-
-      if (verification?.ok) {
-        totalCompleted = verification.completedCount;
-        log(`[Verify] API snapshot: ${verification.beforeCount} pending before, ${verification.afterCount} pending after, ${verification.completedCount} newly completed.`, verification.completedCount > 0 ? 'success' : 'warning', {
-          beforePending: verification.beforeCount,
-          afterPending: verification.afterCount,
-          completed: verification.completedCount,
-          dashboardClicksAttempted: dashboardClickAttempts,
-          externalUrlsProcessed
-        });
-      } else if (attemptedAnyTask) {
-        log(`[Verify] Task attempts finished, but API verification was unavailable. Completed count remains 0.`, 'warning', {
-          reason: verification?.reason || 'api_unavailable',
-          dashboardClicksAttempted: dashboardClickAttempts,
-          externalUrlsProcessed
-        });
-      }
-    } else if (attemptedAnyTask) {
-      log(`[Verify] API baseline was unavailable, so dashboard clicks were not counted as completed.`, 'warning', {
-        dashboardClicksAttempted: dashboardClickAttempts,
-        externalUrlsProcessed
-      });
-    }
-
-    // 🔥 Final summary with clarity
-    if (totalCompleted > 0) {
-      log(`✅ Daily tasks complete! Verified clicked/completed: ${totalCompleted}`, 'success', {
-        completed: totalCompleted,
-        note: 'Verified by API snapshot, not by raw click count'
-      });
-    } else {
-      log(`⚠️ Daily tasks complete but no verified completions detected. Tasks may have been already done or failed.`, 'warning');
-    }
-    
-    return { success: true, completed: totalCompleted };
-
-  } catch (e) {
-    if (dashTabOwned && dashTab) await closeTab(dashTab.id);
-    if (e.message === 'USER_STOPPED') throw e;
-    log(`❌ Daily tasks failed: ${e.message}`, 'error');
-    return { success: false, completed: totalCompleted, error: e.message };
-  }
-}
-
-// ---- AUTOMATION: MOBILE DAILY TASKS ----
-async function runMobileDailyTasks() {
-  let tab = null;
-  let totalCompleted = 0;
-
+  // Strategy 3: Open a hidden rewards.bing.com tab, fetch API (same-origin), then close
   try {
-    log('📱 Enabling mobile mode...');
-    await setMobileMode(true);
-    await sleep(500);
-
-    // Open Bing in mobile mode
-    log('📱 Opening Bing in mobile mode...');
-    tab = await createTab('https://www.bing.com/', false);
-    await waitForTabLoad(tab.id);
+    const tempTab = await chrome.tabs.create({
+      url: 'https://rewards.bing.com/',
+      active: false
+    });
+    await waitForTabLoad(tempTab.id, 20000);
     await sleep(3000);
 
-    log('🔍 Looking for mobile tasks...');
-    const mobileResult = await injectScript(tab.id, () => {
-      return (async function() {
-        const results = { found: 0, clicked: 0, taskNames: [], readArticleUrls: [] };
-        const delay = ms => new Promise(r => setTimeout(r, ms));
-
-        const clickElement = async (el) => {
-          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          await delay(500);
-          if (el.href) { window.open(el.href, '_blank'); } else { el.click(); }
-          await delay(1000);
-        };
-
-        // Scroll down
-        for (let i = 0; i < 8; i++) {
-          window.scrollBy({ top: 300, behavior: 'smooth' });
-          await delay(600);
-        }
-        window.scrollTo(0, 0);
-        await delay(1000);
-
-        // MOBILE TASK 1: Rewards/Check-in
-        const rewardsSelectors = [
-          '[class*="rewards"]', '[id*="rewards"]', '[class*="checkin"]',
-          '[class*="check-in"]', '[class*="streak"]', '#id_rc',
-          '.rewards_flyout', '#rewardsApp'
-        ];
-        for (const sel of rewardsSelectors) {
-          try {
-            const els = document.querySelectorAll(sel);
-            for (const el of els) {
-              const rect = el.getBoundingClientRect();
-              if (rect.width < 20 || rect.height < 20) continue;
-              const text = el.textContent || '';
-              if (text.length > 200) continue;
-              const isClickable = el.tagName === 'A' || el.tagName === 'BUTTON' ||
-                el.style.cursor === 'pointer' || el.getAttribute('role') === 'button';
-              if (isClickable) {
-                results.found++;
-                results.taskNames.push('Rewards: ' + text.substring(0, 40).trim());
-                await clickElement(el);
-                results.clicked++;
-                await delay(3000);
-              }
-            }
-          } catch(e) {}
-        }
-
-        // MOBILE TASK 2: Read to Earn
-        const newsSelectors = [
-          '.news-card a', '[class*="news"] a[href]', '.infopane a[href]',
-          'a.story-card', '[class*="feed"] a[href]', '.content-card a',
-          'article a[href]', '.card a[href*="msn.com"]'
-        ];
-        for (const sel of newsSelectors) {
-          try {
-            const els = document.querySelectorAll(sel);
-            for (const el of els) {
-              const rect = el.getBoundingClientRect();
-              if (rect.width < 50 || rect.height < 30) continue;
-              if (el.href && !results.readArticleUrls.includes(el.href)) {
-                results.readArticleUrls.push(el.href);
-                if (results.readArticleUrls.length >= 5) break;
-              }
-            }
-          } catch(e) {}
-          if (results.readArticleUrls.length >= 5) break;
-        }
-        for (let i = 0; i < Math.min(3, results.readArticleUrls.length); i++) {
-          results.found++;
-          results.taskNames.push('Read: article ' + (i + 1));
-        }
-
-        // MOBILE TASK 3: Point-earning elements
-        const allClickable = document.querySelectorAll('a[href], button, [role="button"]');
-        for (const el of allClickable) {
-          if (results.clicked >= 10) break;
-          const text = el.textContent || '';
-          const rect = el.getBoundingClientRect();
-          if (rect.width < 40 || rect.height < 30) continue;
-          if (el.closest('header') || el.closest('nav')) continue;
-          const hasPoints = text.match(/[+]\s*\d+\s*(pts|points|điểm)?/i);
-          const hasTask = text.match(/(quiz|poll|trivia|daily|check.?in|earn|reward|complete|claim)/i);
-          if (hasPoints || hasTask) {
-            if (text.includes('Sign') || text.includes('Settings')) continue;
-            results.found++;
-            results.taskNames.push('Task: ' + text.substring(0, 40).trim());
-            await clickElement(el);
-            results.clicked++;
-            await delay(3000);
+    // Use ISOLATED world with Promise-based fetch (not async/await) for compatibility
+    const pts = await executeInTabIsolated(tempTab.id, () => {
+      return fetch('/api/getuserinfo?type=1', { cache: 'no-cache', credentials: 'include' })
+        .then(r => r.ok ? r.json() : null)
+        .then(d => d?.dashboard?.userStatus?.availablePoints ?? null)
+        .catch(() => {
+          // Fallback: scrape points from page DOM
+          const el = document.querySelector('#id_rc')
+            || document.querySelector('.mee-icon-AddMedium + span')
+            || document.querySelector('[data-testid="points-balance"]')
+            || document.querySelector('.pointsValue');
+          if (el) {
+            const num = parseInt(el.textContent.replace(/[^0-9]/g, ''), 10);
+            if (!isNaN(num) && num > 0) return num;
           }
-        }
-        return { ...results, readArticleUrls: results.readArticleUrls.slice(0, 3) };
-      })();
+          return null;
+        });
     });
 
-    const mobileData = mobileResult || { found: 0, clicked: 0, taskNames: [], readArticleUrls: [] };
-    totalCompleted += mobileData.clicked;
-    if (mobileData.taskNames?.length > 0) {
-      mobileData.taskNames.forEach(name => log(`   📱 ${name}`));
+    // Close temp tab
+    try { await chrome.tabs.remove(tempTab.id); } catch (e) {}
+
+    if (pts !== null) return pts;
+  } catch (e) {}
+
+  return null;
+}
+
+async function checkPoints() {
+  log('⭐ Kiểm tra điểm...', 'info');
+  const points = await scrapePointsFromAPI();
+  
+  if (points !== null) {
+    state.points.current = points;
+    if (dailyProgress.pointsBefore !== null) {
+      state.points.earned = points - dailyProgress.pointsBefore;
+      dailyProgress.earnedToday = state.points.earned;
     }
-
-    // Read articles (dwell time)
-    const articleUrls = mobileData.readArticleUrls || [];
-    if (articleUrls.length > 0) {
-      log(`📰 Read to Earn: Opening ${articleUrls.length} articles...`);
-      for (const url of articleUrls) {
-        try {
-          await chrome.tabs.update(tab.id, { url });
-          await waitForTabLoad(tab.id).catch(() => {});
-          await sleep(2000);
-
-          await injectScript(tab.id, () => {
-            return (async function() {
-              const delay = ms => new Promise(r => setTimeout(r, ms));
-              const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
-              const scrollCount = randomInt(15, 25);
-              for (let i = 0; i < scrollCount; i++) {
-                window.scrollBy({ top: randomInt(150, 400), behavior: 'smooth' });
-                await delay(randomInt(1000, 3000));
-                if (Math.random() < 0.2) {
-                  window.scrollBy({ top: -randomInt(50, 150), behavior: 'smooth' });
-                  await delay(randomInt(500, 1500));
-                }
-              }
-            })();
-          });
-
-          totalCompleted++;
-          log(`   📰 Read article: ${url.substring(0, 60)}...`);
-          await sleep(1000);
-        } catch (e) {
-          log(`   ⚠️ Article read failed: ${e.message}`, 'warning');
-        }
-      }
-    }
-
-    // Mobile rewards dashboard
-    log('📱 Checking mobile rewards dashboard...');
-    await chrome.tabs.update(tab.id, { url: 'https://rewards.bing.com/' });
-    await waitForTabLoad(tab.id).catch(() => {});
-    await sleep(4000);
-
-    const mobileDashResult = await injectScript(tab.id, () => {
-      return (async function() {
-        const results = { found: 0, clicked: 0, taskNames: [] };
-        const delay = ms => new Promise(r => setTimeout(r, ms));
-        for (let i = 0; i < 5; i++) {
-          window.scrollBy({ top: 300, behavior: 'smooth' });
-          await delay(500);
-        }
-        window.scrollTo(0, 0);
-        await delay(500);
-        const allClickable = document.querySelectorAll('a[href], button, [role="button"]');
-        for (const el of allClickable) {
-          if (results.clicked >= 8) break;
-          const text = el.textContent || '';
-          const rect = el.getBoundingClientRect();
-          if (rect.width < 40 || rect.height < 25) continue;
-          if (el.closest('header') || el.closest('nav')) continue;
-          if (text.includes('Sign in') || text.includes('Redeem') || text.includes('About')) continue;
-          const hasPoints = text.match(/[+•]\s*\d+/);
-          const hasCheck = el.querySelector('[class*="check"]');
-          if (hasPoints && !hasCheck) {
-            results.found++;
-            results.taskNames.push(text.substring(0, 40).trim());
-            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            await delay(400);
-            if (el.href) { window.open(el.href, '_blank'); } else { el.click(); }
-            results.clicked++;
-            await delay(4000);
-          }
-        }
-        return results;
-      })();
-    });
-
-    const mobileDash = mobileDashResult || { found: 0, clicked: 0, taskNames: [] };
-    totalCompleted += mobileDash.clicked;
-    if (mobileDash.taskNames?.length > 0) {
-      mobileDash.taskNames.forEach(n => log(`   📱 Mobile dash: ${n}`));
-    }
-
-    // Disable mobile and cleanup
-    await setMobileMode(false);
-    await sleep(2000);
-    const allTabs = await chrome.tabs.query({});
-    for (const t of allTabs) {
-      if (t.id !== tab.id && (t.url?.includes('bing.com') || t.url?.includes('msn.com'))) {
-        await closeTab(t.id);
-      }
-    }
-    await closeTab(tab.id);
-
-    log(`✅ Mobile tasks completed: ${totalCompleted}`, 'success');
-    return { success: true, completed: totalCompleted };
-
-  } catch (e) {
-    await setMobileMode(false);
-    if (tab) await closeTab(tab.id);
-    if (e.message === 'USER_STOPPED') throw e;
-    log(`❌ Mobile tasks failed: ${e.message}`, 'error');
-    return { success: false, completed: 0, error: e.message };
+    updateState({ points: state.points });
+    log(`⭐ Điểm hiện tại: ${points.toLocaleString()}${state.points.earned !== null ? ` (+${state.points.earned})` : ''}`, 'success');
+    broadcast('daily_progress', dailyProgress);
+  } else {
+    log('⚠️ Không thể lấy điểm. Hãy đăng nhập tại rewards.bing.com', 'warn');
   }
 }
 
-// ---- AUTOMATION: RESET PAGE ----
-async function resetPage() {
+// ═══════════════════════════════════════════════
+// ACCOUNT DIAGNOSTICS
+// ═══════════════════════════════════════════════
+
+async function fetchRewardsDiagnostics() {
+  let tempTab = null;
   try {
-    log('🔄 Resetting & cleaning tabs...');
-    const allTabs = await chrome.tabs.query({});
-    let closedCount = 0;
+    tempTab = await chrome.tabs.create({
+      url: 'https://rewards.bing.com/earn',
+      active: false
+    });
+    await waitForTabLoad(tempTab.id, 20000);
+    await sleep(3500);
 
-    // Find or create rewards tab
-    let rewardsTab = allTabs.find(t => t.url?.includes('rewards.bing.com'));
-    if (!rewardsTab) {
-      rewardsTab = await createTab('https://rewards.bing.com/', true);
-      await waitForTabLoad(rewardsTab.id).catch(() => {});
-    }
+    return await executeInTabIsolated(tempTab.id, () => {
+      const fetchJson = (url) => fetch(url, {
+        cache: 'no-cache',
+        credentials: 'include'
+      }).then(async (response) => ({
+        ok: response.ok,
+        status: response.status,
+        url,
+        data: response.ok ? await response.json().catch(() => null) : null
+      })).catch((error) => ({
+        ok: false,
+        status: 0,
+        url,
+        error: error.message
+      }));
 
-    // Close non-essential tabs
-    for (const t of allTabs) {
-      if (t.id === rewardsTab.id) continue;
-      if (t.url?.includes('bing.com') || t.url?.includes('msn.com')) {
-        await closeTab(t.id);
-        closedCount++;
-      }
-    }
+      const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-    if (closedCount > 0) log(`🗑️ Closed ${closedCount} tabs`);
+      const openPointsBreakdown = async () => {
+        // Try multiple text patterns (English + Vietnamese + partial)
+        const patterns = [/points breakdown/i, /phân tích điểm/i, /breakdown/i, /chi tiết điểm/i];
+        let clickable = null;
 
-    // Reload rewards tab
-    await chrome.tabs.reload(rewardsTab.id);
-    log('✅ Rewards page reloaded', 'success');
-    return { success: true };
-
-  } catch (e) {
-    log(`❌ Reset failed: ${e.message}`, 'error');
-    return { success: false, error: e.message };
-  }
-}
-
-// ---- MESSAGE HANDLER ----
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.action === 'get_state') {
-    sendResponse({ state: getPublicState(), logs: state.logs.slice(0, 50) });
-    return true;
-  }
-
-  if (msg.action === 'get_config') {
-    getConfig().then(config => sendResponse({ config }));
-    return true;
-  }
-
-  if (msg.action === 'save_config') {
-    // Silent save — không log ra terminal (auto-save liên tục)
-    saveConfig(msg.config).then(() => sendResponse({ success: true }));
-    return true;
-  }
-
-  if (msg.action === 'get_daily_progress') {
-    getDailyProgress().then(dp => sendResponse({ dp }));
-    return true;
-  }
-
-  if (msg.action === 'command') {
-    handleCommand(msg.command);
-    sendResponse({ received: true });
-    return true;
-  }
-
-  return false;
-});
-
-async function handleCommand(command) {
-  switch (command) {
-    case 'start_search':
-      if (state.status === 'running') { log('⚠️ Already running!', 'warning'); return; }
-      startSearchAutomation(false).catch(e => {
-        if (e.message !== 'USER_STOPPED') log(`❌ Search Error: ${e.message}`, 'error');
-      });
-      break;
-
-    case 'start_max_mode':
-      if (state.status === 'running') { log('⚠️ Already running!', 'warning'); return; }
-      log('⚡ Max Mode: Tự động tính số search còn thiếu hôm nay...');
-      startSearchAutomation(true).catch(e => {
-        if (e.message !== 'USER_STOPPED') log(`❌ Max Mode Error: ${e.message}`, 'error');
-      });
-      break;
-
-    case 'stop':
-      state.status = 'stopped';
-      // Đảm bảo mobile UA được tắt khi stop
-      await setMobileMode(false).catch(() => {});
-      log('⏹️ Stopped!', 'warning');
-      broadcastState();
-      break;
-
-    case 'check_points':
-      checkPoints().catch(e => {
-        if (e.message !== 'USER_STOPPED') log(`❌ Point Check Error: ${e.message}`, 'error');
-      });
-      break;
-
-    case 'daily_tasks':
-      if (state.status === 'running') { log('⚠️ Already running!', 'warning'); return; }
-      state.status = 'running';
-      broadcastState();
-
-      (async () => {
-        await runDailyTasks();
-        const config = await getConfig();
-        if (config.mobileMode && state.status === 'running') {
-          await runMobileDailyTasks();
+        for (const pattern of patterns) {
+          if (clickable) break;
+          const candidates = Array.from(document.querySelectorAll('button, a, [role="button"], div, span'))
+            .filter((el) => pattern.test((el.innerText || el.textContent || '').trim()));
+          clickable = candidates.find((el) => {
+            const tag = el.tagName?.toLowerCase();
+            return tag === 'button' || tag === 'a' || el.getAttribute('role') === 'button';
+          }) || candidates[0] || null;
         }
-        if (state.status === 'running') state.status = 'idle';
-        broadcastState();
-      })().catch(e => {
-        if (e.message !== 'USER_STOPPED') log(`❌ Task Error: ${e.message}`, 'error');
-      });
-      break;
 
-    case 'reset_page':
-      resetPage().catch(e => {
-        if (e.message !== 'USER_STOPPED') log(`❌ Reset Error: ${e.message}`, 'error');
-      });
-      break;
+        if (clickable) {
+          clickable.click();
+          await delay(1500);
+          return true;
+        }
+        return false;
+      };
 
-    case 'reset_progress':
-      state.status = 'idle';
-      state.progress = '0/0';
-      state.percent = 0;
-      state.currentSearch = 0;
-      state.points = { current: null, earned: 0, baseline: null, lastCheck: null, history: [] };
-      state.wave = { current: 0, total: 0 };
-      log('🔄 Progress + points reset', 'success');
-      broadcastState();
-      break;
+      const getXPathText = (xpath) => {
+        try {
+          const node = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+          return (node?.innerText || node?.textContent || '').trim();
+        } catch (e) {
+          return '';
+        }
+      };
+
+      const getPointsBreakdownText = () => {
+        const panelTexts = [];
+        // Try multiple XPath patterns (original + more generic)
+        [
+          "/html/body/div[4]/div/section/div/div[2]",
+          "/html/body/div[3]/div/section/div/div[2]",
+          "/html/body/div[5]/div/section/div/div[2]",
+          "//*[starts-with(@id,'react-aria-')]/div[1]/div[1]/div[3]",
+          "//*[starts-with(@id,'react-aria-')]//div[contains(@class,'overflow')]",
+          "//section[.//*[contains(normalize-space(.),'Points breakdown')]]",
+          "//section[.//*[contains(normalize-space(.),'breakdown')]]",
+          "//section[.//*[contains(normalize-space(.),'phân tích')]]",
+          "//*[contains(normalize-space(.),'Desktop Bing search') and contains(normalize-space(.),'Mobile Bing search')]",
+          "//*[contains(normalize-space(.),'search') and contains(normalize-space(.),'/')]",
+          "//div[@role='dialog']",
+          "//div[contains(@class,'modal')]",
+          "//div[contains(@class,'overlay')]//section",
+          "//div[contains(@class,'panel')]"
+        ].forEach((xpath) => {
+          const text = getXPathText(xpath);
+          if (text && text.length > 10) panelTexts.push(text);
+        });
+
+        // Also try CSS selectors for dialog/panel/overlay
+        ['[role="dialog"]', '[class*="modal"]', '[class*="overlay"] section', '[class*="panel"]', 'section[class*="breakdown"]'].forEach(sel => {
+          try {
+            document.querySelectorAll(sel).forEach(el => {
+              const text = (el.innerText || el.textContent || '').trim();
+              if (text && text.length > 20 && /\d+\s*\/\s*\d+/.test(text)) panelTexts.push(text);
+            });
+          } catch (e) {}
+        });
+
+        return [...new Set(panelTexts)].join('\n');
+      };
+
+      const activitySpec = [
+        { key: 'bingSearch', title: 'Bing', metric: 'Search', regex: /Bing.{0,160}?Search:\s*(\d+)\s*\/\s*(\d+)/i },
+        { key: 'dailySet', title: 'Daily Set', metric: 'Activity', regex: /Daily Set.{0,160}?Activity:\s*(\d+)\s*\/\s*(\d+)/i },
+        { key: 'edgeMinutes', title: 'Edge', metric: 'Minutes', regex: /Edge.{0,160}?Minutes:\s*(\d+)\s*\/\s*(\d+)/i },
+        { key: 'mobileApp', title: 'Mobile App', metric: 'Check-in', regex: /Mobile App.{0,160}?Check-in:\s*(\d+)\s*\/\s*(\d+)/i },
+        { key: 'mobileSearch', title: 'Mobile Search', metric: 'Search', regex: /Mobile Search.{0,160}?Search:\s*(\d+)\s*\/\s*(\d+)/i }
+      ];
+
+      const classifyCard = (title, metric, text) => {
+        const haystack = `${title} ${metric} ${text}`.toLowerCase();
+        if (/streak/.test(haystack) && /search/.test(haystack)) return 'bingSearchStreak';
+        if (/mobile/.test(haystack) && /search/.test(haystack)) return 'mobileSearch';
+        if (/bing/.test(haystack) && /search/.test(haystack)) return 'bingSearch';
+        if (/daily/.test(haystack)) return 'dailySet';
+        if (/edge|minute/.test(haystack)) return 'edgeMinutes';
+        if (/mobile app|check.?in/.test(haystack)) return 'mobileApp';
+        if (/\bsearch\b/.test(haystack)) return 'bingSearch';
+        return null;
+      };
+
+      const titleForKey = (key, fallback) => ({
+        bingSearch: 'Bing',
+        mobileSearch: 'Mobile Search',
+        bingSearchStreak: 'Bing Search Streak',
+        dailySet: 'Daily Set',
+        edgeMinutes: 'Edge',
+        mobileApp: 'Mobile App'
+      })[key] || fallback || key;
+
+      const parseActivityText = (text, source = 'dashboard-text') => {
+        const clean = String(text || '').replace(/\s+/g, ' ');
+        return activitySpec
+          .map((spec) => {
+            const match = clean.match(spec.regex);
+            if (!match) return null;
+            return {
+              source,
+              key: spec.key,
+              title: spec.title,
+              metric: spec.metric,
+              current: Number(match[1]),
+              max: Number(match[2])
+            };
+          })
+          .filter(Boolean);
+      };
+
+      const parseEarnBreakdown = (text) => {
+        const clean = String(text || '').replace(/\s+/g, ' ');
+        // Multiple regex patterns per key to handle different page formats/locales
+        const rows = [
+          { key: 'bingSearch', title: 'Desktop Bing search', metric: 'Search', regexes: [
+            /Desktop Bing search\s+(\d+)\s*\/\s*(\d+)/i,
+            /PC search\s+(\d+)\s*\/\s*(\d+)/i,
+            /Desktop search\s+(\d+)\s*\/\s*(\d+)/i,
+            /Bing search\s+(\d+)\s*\/\s*(\d+)/i,
+            /Tìm kiếm (?:trên )?(?:máy tính|Bing|PC)\s+(\d+)\s*\/\s*(\d+)/i,
+            /(?:Desktop|PC)\s+(?:Bing\s+)?(?:search|tìm kiếm)\s*[:\s]+(\d+)\s*\/\s*(\d+)/i,
+            /(?:Desktop|PC)\s+(\d+)\s*\/\s*(\d+)/i
+          ]},
+          { key: 'mobileSearch', title: 'Mobile Bing search', metric: 'Search', regexes: [
+            /Mobile Bing search\s+(\d+)\s*\/\s*(\d+)/i,
+            /Mobile search\s+(\d+)\s*\/\s*(\d+)/i,
+            /Tìm kiếm (?:trên )?(?:di động|điện thoại|mobile)\s+(\d+)\s*\/\s*(\d+)/i,
+            /(?:Mobile)\s+(?:Bing\s+)?(?:search|tìm kiếm)\s*[:\s]+(\d+)\s*\/\s*(\d+)/i,
+            /(?:Mobile|Di động)\s+(\d+)\s*\/\s*(\d+)/i
+          ]},
+          { key: 'offers', title: 'Offers', metric: 'Points', regexes: [
+            /Offers\s+(\d+)(?!\s*\/)/i,
+            /(?:Ưu đãi|Phần thưởng)\s+(\d+)(?!\s*\/)/i
+          ]}
+        ];
+
+        const results = [];
+        for (const row of rows) {
+          let match = null;
+          for (const regex of row.regexes) {
+            match = clean.match(regex);
+            if (match) break;
+          }
+          if (!match) continue;
+          results.push({
+            source: 'earn-breakdown',
+            key: row.key,
+            title: row.title,
+            metric: row.metric,
+            current: Number(match[1]),
+            max: match[2] ? Number(match[2]) : Number(match[1])
+          });
+        }
+
+        // Generic fallback: find N/M patterns with M >= 10 (likely search quotas)
+        if (!results.some(r => r.key === 'bingSearch') || !results.some(r => r.key === 'mobileSearch')) {
+          const allMatches = [...clean.matchAll(/([^\d]{2,40}?)\s+(\d+)\s*\/\s*(\d+)/gi)];
+          for (const m of allMatches) {
+            const label = (m[1] || '').trim().toLowerCase();
+            const current = Number(m[2]);
+            const max = Number(m[3]);
+            if (max < 10) continue; // skip small quotas like streak 0/1
+            const hasBing = /bing|search|tìm kiếm/.test(label);
+            const hasMobile = /mobile|di động|điện thoại/.test(label);
+            const hasDesktop = /desktop|pc|máy tính/.test(label);
+            if (hasMobile && !results.some(r => r.key === 'mobileSearch') && max >= 10 && max <= 120) {
+              results.push({ source: 'earn-breakdown', key: 'mobileSearch', title: 'Mobile Bing search', metric: 'Search', current, max });
+            } else if ((hasDesktop || (hasBing && !hasMobile)) && !results.some(r => r.key === 'bingSearch') && max >= 10 && max <= 300) {
+              results.push({ source: 'earn-breakdown', key: 'bingSearch', title: 'Desktop Bing search', metric: 'Search', current, max });
+            }
+          }
+        }
+
+        return results;
+      };
+
+      const parseActivityCards = () => {
+        const specs = [
+          "//div[contains(@class,'grid') and contains(@class,'grid-cols-2') and contains(@class,'gap-3')]//div[contains(@class,'rounded-cornerCardDefault') and contains(@class,'cursor-pointer')]",
+          "//div[contains(@class,'grid-cols-2') and contains(@class,'gap-3')]//div[contains(@class,'bg-bgCardOnPrimaryDefaultRest')]"
+        ];
+
+        const cards = [];
+        for (const xpath of specs) {
+          const snapshot = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+          for (let i = 0; i < snapshot.snapshotLength; i++) {
+            const node = snapshot.snapshotItem(i);
+            if (node && !cards.includes(node)) cards.push(node);
+          }
+        }
+
+        if (!cards.length) {
+          document.querySelectorAll('[class*="rounded-cornerCardDefault"][class*="cursor-pointer"], [class*="bg-bgCardOnPrimaryDefaultRest"]')
+            .forEach((node) => cards.push(node));
+        }
+
+        return cards
+          .map((card, index) => {
+            const text = (card.innerText || card.textContent || '').replace(/\s+/g, ' ').trim();
+            const progress = text.match(/([A-Za-z][A-Za-z -]{1,30}):\s*(\d+)\s*\/\s*(\d+)/i);
+            if (!progress) return null;
+
+            const beforeMetric = text.slice(0, progress.index).trim();
+            const title = beforeMetric.split(/\s{2,}| \+/)[0] || beforeMetric || `Activity ${index + 1}`;
+            const metric = progress[1].trim();
+            const key = classifyCard(title, metric, text);
+            if (!key) return null;
+
+            return {
+              source: 'dashboard-card',
+              key,
+              title: titleForKey(key, title),
+              metric,
+              current: Number(progress[2]),
+              max: Number(progress[3]),
+              text: text.slice(0, 180)
+            };
+          })
+          .filter(Boolean);
+      };
+
+      return Promise.all([
+        fetchJson('/api/getuserinfo?type=1'),
+        fetchJson('/api/getuserinfo?type=2'),
+        fetchJson('/api/getpointsbreakdown')
+      ]).then(async ([info, fullInfo, breakdown]) => {
+        await openPointsBreakdown();
+        const breakdownText = getPointsBreakdownText();
+        const pageText = [breakdownText, document.body?.innerText || ''].join('\n').slice(0, 12000);
+        const earnActivities = parseEarnBreakdown(breakdownText || pageText);
+        const cardActivities = parseActivityCards();
+        const textActivities = parseActivityText(pageText);
+        return {
+          info,
+          fullInfo,
+          breakdown,
+          pageText,
+          breakdownText,
+          activities: [...earnActivities, ...cardActivities, ...textActivities],
+          href: location.href
+        };
+      });
+    });
+  } finally {
+    if (tempTab?.id) {
+      try { await chrome.tabs.remove(tempTab.id); } catch (e) {}
+    }
   }
 }
 
-// ---- KEEP-ALIVE ----
-chrome.alarms.create('keepAlive', { periodInMinutes: 1 });
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'keepAlive' && (state.status === 'running' || state.status === 'cooldown')) {
-    // Service worker stays alive while automation is active
+function findSearchCounters(counters) {
+  const results = [];
+  if (!counters || typeof counters !== 'object') return results;
+
+  for (const [key, counter] of Object.entries(counters)) {
+    if (!counter || typeof counter !== 'object') continue;
+    const text = `${key} ${counter.name || ''} ${counter.description || ''}`.toLowerCase();
+    if (!/(search|pc|mobile|edge|bing)/i.test(text)) continue;
+
+    results.push({
+      key,
+      name: counter.name || key,
+      current: counter.count ?? counter.pointProgress ?? counter.progress ?? counter.pointprogress ?? 0,
+      max: counter.max ?? counter.pointProgressMax ?? counter.target ?? counter.completionTarget ?? counter.maxValue ?? counter.goal ?? counter.pointprogressmax ?? 0,
+      complete: !!counter.complete
+    });
+  }
+
+  return results;
+}
+
+function classifyActivity(text) {
+  const normalized = String(text || '').toLowerCase();
+  if (/streak/.test(normalized) && /search/.test(normalized)) return 'bingSearchStreak';
+  if (/mobile/.test(normalized) && /search/.test(normalized)) return 'mobileSearch';
+  if (/bing/.test(normalized) && /search/.test(normalized)) return 'bingSearch';
+  if (/\bsearch\b|pc search|desktop search/.test(normalized)) return 'bingSearch';
+  if (/daily/.test(normalized)) return 'dailySet';
+  if (/edge|minute/.test(normalized)) return 'edgeMinutes';
+  if (/mobile app|check.?in/.test(normalized)) return 'mobileApp';
+  return null;
+}
+
+function collectRewardActivities(raw) {
+  const activities = [];
+  const seen = new Set();
+
+  const addActivity = (activity) => {
+    if (!activity || !activity.key) return;
+    const current = Number(activity.current);
+    const max = Number(activity.max);
+    if (!Number.isFinite(current) || !Number.isFinite(max) || max <= 0) return;
+    const id = `${activity.key}:${activity.title}:${activity.metric}:${current}/${max}`;
+    if (seen.has(id)) return;
+    seen.add(id);
+    activities.push({ ...activity, current, max, remaining: Math.max(0, max - current) });
+  };
+
+  (raw?.activities || []).forEach(addActivity);
+
+  const dashboard = raw?.info?.data?.dashboard || raw?.fullInfo?.data?.dashboard || raw?.info?.data || raw?.fullInfo?.data;
+  const counters = dashboard?.userStatus?.counters || {};
+  for (const [key, counter] of Object.entries(counters)) {
+    if (!counter || typeof counter !== 'object') continue;
+    const label = `${key} ${counter.name || ''} ${counter.description || ''}`;
+    const kind = classifyActivity(label);
+    if (!kind) continue;
+
+    addActivity({
+      source: 'api',
+      key: kind,
+      title: counter.name || key,
+      metric: /minute|edge/i.test(label) ? 'Minutes' : /check/i.test(label) ? 'Check-in' : 'Progress',
+      current: counter.count ?? counter.pointProgress ?? counter.progress ?? counter.pointprogress ?? 0,
+      max: counter.max ?? counter.pointProgressMax ?? counter.target ?? counter.completionTarget ?? counter.maxValue ?? counter.goal ?? counter.pointprogressmax ?? 0
+    });
+  }
+
+  const authoritativeKeys = new Set(
+    activities
+      .filter(activity => activity.source === 'earn-breakdown' && ['bingSearch', 'mobileSearch'].includes(activity.key))
+      .map(activity => activity.key)
+  );
+
+  if (!authoritativeKeys.size) return activities;
+
+  return activities.filter(activity => {
+    if (!authoritativeKeys.has(activity.key)) return true;
+    return activity.source === 'earn-breakdown';
+  });
+}
+
+function logRewardActivities(activities) {
+  if (!activities.length) {
+    log('⚠️ Không đọc được thẻ activity trên dashboard. Tool sẽ dùng số lượt bạn nhập.', 'warn');
+    return;
+  }
+
+  activities.forEach((activity) => {
+    const done = activity.remaining <= 0 ? 'done' : `còn ${activity.remaining}`;
+    log(`📊 ${activity.title} ${activity.metric}: ${activity.current}/${activity.max} (${done})`, activity.remaining <= 0 ? 'success' : 'info');
+  });
+}
+
+function pickBestActivity(activities, key) {
+  return activities
+    .filter((item) => item.key === key)
+    .sort((a, b) => {
+      const sourceScore = (item) => item.source === 'earn-breakdown' ? 2 : item.source === 'api' ? 1 : 0;
+      return sourceScore(b) - sourceScore(a) || b.max - a.max;
+    })[0] || null;
+}
+
+function isLikelySearchQuotaActivity(activity, key) {
+  if (!activity) return false;
+  const text = `${activity.title || ''} ${activity.metric || ''} ${activity.text || ''}`.toLowerCase();
+
+  if (/streak/.test(text)) return false;
+  if (key === 'bingSearch') {
+    if (/desktop bing search|pc search|desktop search/.test(text)) return true;
+    return activity.max >= 10;
+  }
+
+  if (key === 'mobileSearch') {
+    if (/mobile bing search|mobile search/.test(text)) return true;
+    return activity.max >= 8;
+  }
+
+  return true;
+}
+
+async function scanRewardActivities({ logDetails = true } = {}) {
+  let raw = null;
+  try {
+    raw = await fetchRewardsDiagnostics();
+  } catch (e) {
+    if (logDetails) log(`⚠️ Scan activity lỗi: ${e.message}`, 'warn');
+    return { raw: null, activities: [] };
+  }
+
+  const activities = collectRewardActivities(raw);
+  await cacheSearchQuotaFromActivities(activities);
+  if (logDetails) logRewardActivities(activities);
+  return { raw, activities };
+}
+
+async function getActivitySearchPlan(requestedPc, requestedMobile) {
+  log('📊 Check activity trước khi search...', 'info');
+  const cachedQuota = await getCachedSearchQuota();
+  if (cachedQuota) {
+    let pcCount = requestedPc;
+    let mobileCount = requestedMobile;
+    const pcRemaining = Number(cachedQuota.pc);
+    const mobileRemaining = Number(cachedQuota.mobile);
+
+    if (Number.isFinite(pcRemaining)) pcCount = Math.min(pcCount, Math.max(0, pcRemaining));
+    if (Number.isFinite(mobileRemaining)) mobileCount = Math.min(mobileCount, Math.max(0, mobileRemaining));
+
+    log(`📊 Dùng quota cache hôm nay: PC còn ${Number.isFinite(pcRemaining) ? pcRemaining : '?'}, Mobile còn ${Number.isFinite(mobileRemaining) ? mobileRemaining : '?'}.`, 'info');
+    return {
+      pcCount,
+      mobileCount,
+      reason: pcCount <= 0 && mobileCount <= 0
+        ? '✅ Quota cache cho thấy search hôm nay đã đủ hoặc không còn lượt cần chạy.'
+        : ''
+    };
+  }
+
+  const { activities } = await scanRewardActivities({ logDetails: true });
+  let pcCount = requestedPc;
+  let mobileCount = requestedMobile;
+  let reason = '';
+
+  const bingSearchRaw = pickBestActivity(activities, 'bingSearch');
+  const bingSearch = isLikelySearchQuotaActivity(bingSearchRaw, 'bingSearch') ? bingSearchRaw : null;
+  if (bingSearchRaw && !bingSearch) {
+    log(`ℹ️ Bỏ qua activity Bing Search không đáng tin (${bingSearchRaw.current}/${bingSearchRaw.max}) vì có thể là streak/card phụ.`, 'info');
+  }
+
+  if (bingSearch) {
+    pcCount = Math.min(pcCount, bingSearch.remaining);
+    if (bingSearch.remaining <= 0) log(`✅ PC Search đã đủ ${bingSearch.current}/${bingSearch.max}, bỏ PC search.`, 'success');
+    else if (pcCount < requestedPc) log(`ℹ️ Giảm PC search từ ${requestedPc} xuống ${pcCount} theo quota PC Search còn lại.`, 'info');
+  }
+
+  const mobileSearchRaw = pickBestActivity(activities, 'mobileSearch');
+  const mobileSearch = isLikelySearchQuotaActivity(mobileSearchRaw, 'mobileSearch') ? mobileSearchRaw : null;
+  if (mobileSearchRaw && !mobileSearch) {
+    log(`ℹ️ Bỏ qua activity Mobile Search không đáng tin (${mobileSearchRaw.current}/${mobileSearchRaw.max}).`, 'info');
+  }
+
+  if (mobileSearch) {
+    mobileCount = Math.min(mobileCount, mobileSearch.remaining);
+    if (mobileSearch.remaining <= 0) log(`✅ Mobile Search đã đủ ${mobileSearch.current}/${mobileSearch.max}, bỏ mobile search.`, 'success');
+    else if (mobileCount < requestedMobile) log(`ℹ️ Giảm Mobile search từ ${requestedMobile} xuống ${mobileCount} theo quota Mobile Search còn lại.`, 'info');
+  }
+
+  if (!bingSearch && !mobileSearch) {
+    log('ℹ️ Không thấy quota search đáng tin từ activity. Giữ số lượt đã nhập.', 'info');
+  }
+
+  if (pcCount <= 0 && mobileCount <= 0) {
+    reason = '✅ Activity cho thấy search hôm nay đã đủ hoặc không còn lượt cần chạy.';
+  }
+
+  return { pcCount, mobileCount, reason };
+}
+
+function findSuspiciousSignals(value, path = '', hits = []) {
+  const terms = /(suspend|ban|blocked|restrict|ineligible|eligible|violation|fraud|abuse|disabled|locked)/i;
+  if (hits.length >= 20 || value === null || value === undefined) return hits;
+
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    const text = String(value);
+    if (terms.test(path) || terms.test(text)) hits.push(`${path}: ${text}`.slice(0, 160));
+    return hits;
+  }
+
+  if (Array.isArray(value)) {
+    value.slice(0, 50).forEach((item, index) => findSuspiciousSignals(item, `${path}[${index}]`, hits));
+    return hits;
+  }
+
+  if (typeof value === 'object') {
+    Object.entries(value).slice(0, 120).forEach(([key, item]) => {
+      const nextPath = path ? `${path}.${key}` : key;
+      if (terms.test(key)) hits.push(`${nextPath}: ${String(item).slice(0, 120)}`);
+      findSuspiciousSignals(item, nextPath, hits);
+    });
+  }
+
+  return [...new Set(hits)].slice(0, 20);
+}
+
+function analyzeRewardsDiagnostics(raw) {
+  const issues = [];
+  const warnings = [];
+  const good = [];
+
+  const info = raw?.info;
+  const fullInfo = raw?.fullInfo;
+  const breakdown = raw?.breakdown;
+  const dashboard = info?.data?.dashboard || fullInfo?.data?.dashboard || info?.data || fullInfo?.data;
+  const userStatus = dashboard?.userStatus || {};
+  const counters = userStatus.counters || {};
+  let searchCounters = findSearchCounters(counters);
+  const points = userStatus.availablePoints;
+
+  // Fallback: if findSearchCounters got max=0 for all entries, supplement from collectRewardActivities
+  const allMaxZero = searchCounters.length === 0 || searchCounters.every(sc => sc.max === 0);
+  if (allMaxZero) {
+    try {
+      const activities = collectRewardActivities(raw);
+      const pcAct = pickBestActivity(activities, 'bingSearch');
+      const mobAct = pickBestActivity(activities, 'mobileSearch');
+      const fallbackCounters = [];
+      if (pcAct && pcAct.max > 0) {
+        fallbackCounters.push({ key: 'pcSearch', name: pcAct.title || 'PC Search', current: pcAct.current, max: pcAct.max, complete: pcAct.remaining <= 0 });
+      }
+      if (mobAct && mobAct.max > 0) {
+        fallbackCounters.push({ key: 'mobileSearch', name: mobAct.title || 'Mobile Search', current: mobAct.current, max: mobAct.max, complete: mobAct.remaining <= 0 });
+      }
+      if (fallbackCounters.length > 0) {
+        searchCounters = fallbackCounters;
+      }
+    } catch (e) { /* ignore fallback errors */ }
+  }
+
+  if (!raw) {
+    issues.push('Không lấy được dữ liệu Rewards.');
+    return { verdict: 'unknown', issues, warnings, good, points: null, searchCounters: [] };
+  }
+
+  if (info?.ok || fullInfo?.ok) good.push('Rewards API còn phản hồi.');
+  else issues.push(`Rewards API lỗi (${info?.status || 0}/${fullInfo?.status || 0}). Có thể chưa đăng nhập hoặc bị chặn phiên.`);
+
+  if (typeof points === 'number') good.push(`Đọc được điểm hiện tại: ${points.toLocaleString()}.`);
+  else warnings.push('Không đọc được availablePoints từ API.');
+
+  if (searchCounters.length > 0) {
+    good.push(`Tìm thấy ${searchCounters.length} counter liên quan search.`);
+  } else if (info?.ok || fullInfo?.ok) {
+    warnings.push('Không thấy search counter trong dữ liệu Rewards. Đây có thể là dấu hiệu bị giới hạn search earning hoặc API đổi format.');
+  }
+
+  if (breakdown?.ok) good.push('Points breakdown còn mở được.');
+  else warnings.push(`Không lấy được points breakdown (${breakdown?.status || 0}).`);
+
+  const suspicious = [
+    ...findSuspiciousSignals(info?.data),
+    ...findSuspiciousSignals(fullInfo?.data),
+    ...findSuspiciousSignals(breakdown?.data)
+  ];
+  if (suspicious.length > 0) {
+    warnings.push(`Có field nhạy cảm trong API: ${suspicious.slice(0, 4).join(' | ')}`);
+  }
+
+  const pageText = (raw.pageText || '').toLowerCase();
+  if (/(suspended|restricted|not eligible|violation|blocked|locked)/i.test(pageText)) {
+    issues.push('Trang Rewards có chữ liên quan suspended/restricted/not eligible.');
+  }
+
+  if ((dailyProgress.searchesDone || 0) >= 5 && (dailyProgress.earnedToday || 0) <= 0) {
+    warnings.push(`Local progress hôm nay đã ghi ${dailyProgress.searchesDone} search nhưng điểm earned vẫn ${dailyProgress.earnedToday || 0}. Nếu vừa chạy xong mà vẫn vậy thì nghi ngờ bị giới hạn điểm search.`);
+  }
+
+  const verdict = issues.length > 0
+    ? 'bad'
+    : warnings.length >= 2
+      ? 'suspicious'
+      : warnings.length === 1
+        ? 'watch'
+        : 'ok';
+
+  return { verdict, issues, warnings, good, points, searchCounters };
+}
+
+function handleBanStatusUpdate(apiData, timestamp) {
+  try {
+    if (typeof analyzeBanStatus !== 'function') {
+      log('⚠️ ban-detection.js chưa sẵn sàng', 'warn');
+      return;
+    }
+
+    const analyzed = analyzeBanStatus(apiData) || {};
+    banStatus = {
+      status: analyzed.status || 'UNKNOWN',
+      reasons: Array.isArray(analyzed.reasons) ? analyzed.reasons : [],
+      signals: analyzed.signals || {},
+      updatedAt: timestamp || Date.now()
+    };
+
+    broadcast('ban_status', banStatus);
+    updateBanIndicatorUI();
+
+    if (banStatus.status === 'BAN') {
+      log(`🚫 BAN DETECTED: ${(banStatus.reasons || []).join(' | ') || 'Unknown reason'}`, 'error');
+    } else if (banStatus.status === 'WARN') {
+      log(`⚠️ Ban warning: ${(banStatus.reasons || []).join(' | ') || 'Abnormal signals'}`, 'warn');
+    } else if (banStatus.status === 'OK') {
+      log('✅ Ban status: OK', 'success');
+    } else {
+      log('ℹ️ Ban status: UNKNOWN', 'info');
+    }
+  } catch (e) {
+    log(`⚠️ Ban detection error: ${e.message}`, 'warn');
+  }
+}
+
+async function checkAccountDiagnostics() {
+  if (isRunning) {
+    log('⚠️ Đang search, dừng xong rồi hãy Check Ban để kết quả sạch hơn.', 'warn');
+    return;
+  }
+
+  log('🩺 Check tài khoản: đang đọc Rewards API...', 'info');
+  let raw = null;
+  try {
+    raw = await fetchRewardsDiagnostics();
+  } catch (e) {
+    log(`❌ Check Ban lỗi: ${e.message}`, 'error');
+    return;
+  }
+
+  const result = analyzeRewardsDiagnostics(raw);
+  const activities = collectRewardActivities(raw);
+  await cacheSearchQuotaFromActivities(activities);
+
+  if (typeof result.points === 'number') {
+    state.points.current = result.points;
+    updateState({ points: state.points });
+  }
+
+  result.good.slice(0, 4).forEach(item => log(`✅ ${item}`, 'success'));
+
+  // Diagnostic: show breakdown text snippet for debugging
+  const bdt = (raw?.breakdownText || '').replace(/\s+/g, ' ').trim();
+  if (bdt) {
+    log(`🔬 Breakdown text (${bdt.length} chars): "${bdt.slice(0, 200)}${bdt.length > 200 ? '...' : ''}"`, 'info');
+  } else {
+    log('🔬 Breakdown text: (trống — panel có thể không mở được)', 'warn');
+  }
+
+  logRewardActivities(activities);
+  result.warnings.slice(0, 5).forEach(item => log(`⚠️ ${item}`, 'warn'));
+  result.issues.slice(0, 5).forEach(item => log(`❌ ${item}`, 'error'));
+
+  if (result.searchCounters.length > 0) {
+    result.searchCounters.slice(0, 4).forEach(counter => {
+      log(`🔎 Counter: ${counter.name} = ${counter.current}/${counter.max}${counter.complete ? ' (done)' : ''}`, 'info');
+    });
+  }
+
+  const verdictText = {
+    ok: '✅ Kết luận: chưa thấy dấu hiệu ban/giới hạn rõ ràng.',
+    watch: '⚠️ Kết luận: có 1 dấu hiệu lạ, nên chạy ít lượt test rồi check điểm lại.',
+    suspicious: '⚠️ Kết luận: nghi ngờ bị giới hạn/ban ẩn search earning.',
+    bad: '❌ Kết luận: có dấu hiệu mạnh tài khoản đang bị chặn/hạn chế hoặc phiên đăng nhập lỗi.',
+    unknown: '⚠️ Kết luận: không đủ dữ liệu để đánh giá.'
+  };
+  log(verdictText[result.verdict] || verdictText.unknown, result.verdict === 'ok' ? 'success' : 'warn');
+  log('ℹ️ Check này là chẩn đoán theo dấu hiệu, không phải xác nhận chính thức từ Microsoft.', 'info');
+}
+
+// ═══════════════════════════════════════════════
+// STOP / RESET / CLEANUP
+// ═══════════════════════════════════════════════
+
+function stopSearch() {
+  if (!isRunning) return;
+  isRunning = false;
+  log('🛑 Đã dừng.', 'warn');
+  updateState({ status: 'stopped' });
+}
+
+async function resetPage() {
+  log('🔄 Reset page & tabs...', 'info');
+  await closeSearchTab();
+  // Close all Bing tabs
+  try {
+    const tabs = await chrome.tabs.query({ url: '*://www.bing.com/*' });
+    for (const tab of tabs) {
+      try { await chrome.tabs.remove(tab.id); } catch (e) {}
+    }
+  } catch (e) {}
+  await disableMobileUA();
+  updateState({ status: 'idle', progress: '0/0', percent: 0, currentQuery: '' });
+  log('✅ Reset hoàn tất', 'success');
+}
+
+function resetProgress() {
+  dailyProgress = {
+    date: new Date().toDateString(),
+    earnedToday: 0,
+    searchesDone: 0,
+    pcDone: 0,
+    mobileDone: 0,
+    pointsBefore: null,
+  };
+  saveDailyProgress();
+  state.points = { current: null, earned: null, baseline: null };
+  updateState({ status: 'idle', progress: '0/0', percent: 0 });
+  broadcast('daily_progress', dailyProgress);
+  log('🗑️ Tiến trình đã được xóa', 'info');
+}
+
+async function clearBingData() {
+  log('🧹 Xóa cache Bing...', 'info');
+  try {
+    await chrome.browsingData.remove(
+      {
+        origins: ['https://www.bing.com', 'https://bing.com'],
+      },
+      {
+        cache: true,
+        localStorage: true,
+        formData: true,
+        history: true,
+        indexedDB: true,
+        // NOT cookies — keep login session
+      }
+    );
+    log('✅ Đã xóa cache Bing (giữ session login)', 'success');
+  } catch (e) {
+    log(`⚠️ Clear data error: ${e.message}`, 'warn');
+  }
+}
+
+// ═══════════════════════════════════════════════
+// DONE PAGE & CONTROL WINDOW
+// ═══════════════════════════════════════════════
+
+function openDonePage() {
+  const params = new URLSearchParams({
+    searches: dailyProgress.searchesDone,
+    earned: dailyProgress.earnedToday || 0,
+    duration: runStartTime ? Math.round((Date.now() - runStartTime) / 1000) : 0,
+    mode: config.mobileMode ? 'both' : 'desktop',
+  });
+  
+  chrome.tabs.create({
+    url: chrome.runtime.getURL(`done.html?${params}`),
+    active: true
+  });
+}
+
+async function openControlWindow() {
+  try {
+    const stored = await new Promise(r => chrome.storage.local.get('controlWindowBounds', r));
+    const bounds = stored.controlWindowBounds || { width: 380, height: 600 };
+    
+    await chrome.windows.create({
+      url: chrome.runtime.getURL('popup.html?detached=1'),
+      type: 'popup',
+      width: bounds.width || 380,
+      height: bounds.height || 600,
+      left: bounds.left,
+      top: bounds.top,
+      focused: true
+    });
+  } catch (e) {
+    log(`⚠️ Cannot open control window: ${e.message}`, 'warn');
+  }
+}
+
+// ═══════════════════════════════════════════════
+// STARTUP
+// ═══════════════════════════════════════════════
+
+chrome.runtime.onInstalled.addListener(async () => {
+  try {
+    await loadConfig();
+    log('⚡ Extension installed/updated — v4.1 Compact Runner', 'info');
+    
+    // Create context menu for data extractor
+    try {
+      chrome.contextMenus.create({
+        id: 'open-data-extractor',
+        title: '🔍 Microsoft Data Extractor',
+        contexts: ['action']
+      });
+    } catch (e) {
+      // Ignore duplicate context menu errors
+    }
+  } catch (e) {
+    console.warn('[BRA] onInstalled error:', e);
   }
 });
 
-// ---- INIT ----
-log('⚡ Extension loaded', 'success');
+chrome.runtime.onStartup.addListener(async () => {
+  try {
+    await loadConfig();
+    await updateBanIndicatorUI();
+  } catch (e) {
+    console.warn('[BRA] onStartup error:', e);
+  }
+});
+
+// Context menu click handler
+chrome.contextMenus.onClicked.addListener((info) => {
+  if (info.menuItemId === 'open-data-extractor') {
+    chrome.tabs.create({
+      url: chrome.runtime.getURL('extract.html'),
+      active: true
+    });
+  }
+});
+
+// Load config immediately
+loadConfig().then(() => updateBanIndicatorUI()).catch(e => console.warn('[BRA] init error:', e));

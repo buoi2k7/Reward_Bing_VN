@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <title>Microsoft Data Extractor</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #0a0e17;
+      color: #e2e8f0;
+      min-height: 100vh;
+      padding: 24px;
+    }
+    .container { max-width: 900px; margin: 0 auto; }
+    
+    header {
+      display: flex; align-items: center; gap: 16px;
+      margin-bottom: 24px; padding: 20px;
+      background: linear-gradient(135deg, rgba(59,130,246,0.12), rgba(139,92,246,0.12));
+      border: 1px solid rgba(59,130,246,0.25);
+      border-radius: 12px;
+    }
+    header .icon { font-size: 36px; }
+    header h1 { font-size: 22px; font-weight: 700; }
+    header p { font-size: 13px; color: #94a3b8; margin-top: 4px; }
+
+    .actions {
+      display: flex; gap: 12px; margin-bottom: 24px; flex-wrap: wrap;
+    }
+    .btn {
+      padding: 10px 20px; border: 1px solid rgba(59,130,246,0.4);
+      background: rgba(59,130,246,0.1); color: #60a5fa;
+      border-radius: 8px; font-size: 14px; font-weight: 600;
+      cursor: pointer; transition: all 0.2s;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .btn:hover { background: rgba(59,130,246,0.25); box-shadow: 0 0 20px rgba(59,130,246,0.2); }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-primary { background: rgba(59,130,246,0.2); border-color: rgba(59,130,246,0.5); }
+    .btn-success { background: rgba(16,185,129,0.1); border-color: rgba(16,185,129,0.4); color: #34d399; }
+    .btn-success:hover { background: rgba(16,185,129,0.25); }
+    .btn-warning { background: rgba(245,158,11,0.1); border-color: rgba(245,158,11,0.4); color: #fbbf24; }
+    .btn-warning:hover { background: rgba(245,158,11,0.25); }
+
+    .progress-section {
+      margin-bottom: 24px; padding: 16px;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 10px; display: none;
+    }
+    .progress-section.active { display: block; }
+    .progress-bar-bg {
+      height: 8px; background: rgba(255,255,255,0.06);
+      border-radius: 4px; overflow: hidden; margin: 10px 0;
+    }
+    .progress-bar {
+      height: 100%; width: 0%; border-radius: 4px;
+      background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+      transition: width 0.4s ease;
+    }
+    .progress-text { font-size: 13px; color: #94a3b8; }
+    .progress-task { font-size: 12px; color: #60a5fa; font-family: monospace; margin-top: 4px; }
+
+    .results { display: flex; flex-direction: column; gap: 16px; }
+    
+    .card {
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 10px; overflow: hidden;
+    }
+    .card-header {
+      padding: 12px 16px; display: flex; justify-content: space-between; align-items: center;
+      background: rgba(255,255,255,0.04); border-bottom: 1px solid rgba(255,255,255,0.06);
+      cursor: pointer; user-select: none;
+    }
+    .card-header h3 { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+    .card-header .badge {
+      font-size: 11px; padding: 2px 8px; border-radius: 10px;
+      background: rgba(59,130,246,0.15); color: #60a5fa; font-weight: 700;
+    }
+    .card-header .toggle { font-size: 12px; color: #64748b; transition: transform 0.2s; }
+    .card-header.collapsed .toggle { transform: rotate(-90deg); }
+    .card-body {
+      padding: 16px; max-height: 400px; overflow-y: auto;
+      font-family: 'Cascadia Code', 'Fira Code', monospace;
+      font-size: 12px; line-height: 1.6;
+      white-space: pre-wrap; word-break: break-word;
+      color: #cbd5e1;
+    }
+    .card-body.collapsed { display: none; }
+
+    .summary-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      gap: 12px; padding: 16px;
+    }
+    .summary-item {
+      padding: 12px; border-radius: 8px;
+      background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06);
+      text-align: center;
+    }
+    .summary-value {
+      font-size: 20px; font-weight: 800; color: #60a5fa;
+      font-family: 'Cascadia Code', monospace;
+    }
+    .summary-label { font-size: 11px; color: #64748b; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+    .error-list { color: #f87171; font-size: 12px; padding: 12px 16px; }
+    .error-list li { margin: 4px 0; }
+
+    .json-key { color: #60a5fa; }
+    .json-string { color: #34d399; }
+    .json-number { color: #fbbf24; }
+    .json-bool { color: #f472b6; }
+    .json-null { color: #64748b; }
+
+    .empty-state {
+      text-align: center; padding: 60px 20px; color: #475569;
+    }
+    .empty-state .icon { font-size: 48px; margin-bottom: 16px; }
+    .empty-state p { font-size: 14px; }
+
+    footer {
+      text-align: center; margin-top: 32px; padding: 16px;
+      font-size: 12px; color: #334155;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="icon">🔍</div>
+      <div>
+        <h1>Microsoft Data Extractor</h1>
+        <p>Lấy toàn bộ dữ liệu Microsoft Rewards, điểm, offers, lịch sử search, streak — xuất JSON</p>
+      </div>
+    </header>
+
+    <div class="actions">
+      <button class="btn btn-primary" id="btn-extract" onclick="startExtract()">
+        ⚡ Trích xuất tất cả dữ liệu
+      </button>
+      <button class="btn btn-success" id="btn-download" onclick="downloadData()" disabled>
+        💾 Tải JSON
+      </button>
+      <button class="btn btn-warning" id="btn-copy" onclick="copyData()" disabled>
+        📋 Copy JSON
+      </button>
+      <button class="btn" id="btn-quick" onclick="quickPoints()">
+        ⭐ Quick Points Check
+      </button>
+    </div>
+
+    <div class="progress-section" id="progress-section">
+      <div class="progress-text" id="progress-text">Đang trích xuất...</div>
+      <div class="progress-bar-bg">
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+      <div class="progress-task" id="progress-task"></div>
+    </div>
+
+    <div class="results" id="results">
+      <div class="empty-state" id="empty-state">
+        <div class="icon">📊</div>
+        <p>Nhấn <strong>"Trích xuất tất cả dữ liệu"</strong> để bắt đầu.<br>
+        Bạn cần đăng nhập tại <a href="https://rewards.bing.com" target="_blank" style="color:#60a5fa">rewards.bing.com</a> trước.</p>
+      </div>
+    </div>
+
+    <footer>Microsoft Data Extractor v1.0 · Bing Rewards Auto v4.0</footer>
+  </div>
+
+  <script src="ms-data-extract.js"></script>
+  <script>
+    let extractedData = null;
+
+    async function startExtract() {
+      const btn = document.getElementById('btn-extract');
+      const progressSection = document.getElementById('progress-section');
+      const progressBar = document.getElementById('progress-bar');
+      const progressText = document.getElementById('progress-text');
+      const progressTask = document.getElementById('progress-task');
+
+      btn.disabled = true;
+      btn.textContent = '⏳ Đang trích xuất...';
+      progressSection.classList.add('active');
+      document.getElementById('empty-state').style.display = 'none';
+
+      try {
+        extractedData = await MSDataExtractor.extractAll((progress) => {
+          progressBar.style.width = progress.percent + '%';
+          progressText.textContent = `${progress.current}/${progress.total} — ${progress.percent}%`;
+          progressTask.textContent = `→ ${progress.taskName}`;
+        });
+
+        renderResults(extractedData);
+        document.getElementById('btn-download').disabled = false;
+        document.getElementById('btn-copy').disabled = false;
+      } catch (e) {
+        progressTask.textContent = `❌ Lỗi: ${e.message}`;
+        progressTask.style.color = '#f87171';
+      }
+
+      btn.disabled = false;
+      btn.innerHTML = '🔄 Trích xuất lại';
+      progressSection.classList.remove('active');
+    }
+
+    async function quickPoints() {
+      const btn = document.getElementById('btn-quick');
+      btn.disabled = true;
+      btn.textContent = '⏳ ...';
+      
+      try {
+        const resp = await fetch('https://rewards.bing.com/api/getuserinfo?type=1', {
+          credentials: 'include', cache: 'no-cache'
+        });
+        const data = await resp.json();
+        const pts = data?.dashboard?.userStatus?.availablePoints;
+        const lifetime = data?.dashboard?.userStatus?.lifetimePoints;
+        
+        if (pts !== undefined) {
+          alert(`⭐ Điểm hiện tại: ${pts.toLocaleString()}\n🏆 Lifetime: ${(lifetime || 0).toLocaleString()}`);
+        } else {
+          alert('❌ Không lấy được điểm. Hãy đăng nhập tại rewards.bing.com');
+        }
+      } catch (e) {
+        alert('❌ Lỗi: ' + e.message);
+      }
+      
+      btn.disabled = false;
+      btn.textContent = '⭐ Quick Points Check';
+    }
+
+    function renderResults(data) {
+      const container = document.getElementById('results');
+      container.innerHTML = '';
+
+      // Summary card first
+      if (data.accountSummary) {
+        const summaryCard = document.createElement('div');
+        summaryCard.className = 'card';
+        summaryCard.innerHTML = `
+          <div class="card-header" onclick="toggleCard(this)">
+            <h3>📊 Account Summary</h3>
+            <span class="toggle">▼</span>
+          </div>
+          <div class="summary-grid">
+            ${summaryItem('⭐', data.accountSummary.currentPoints, 'Điểm hiện tại')}
+            ${summaryItem('🏆', data.accountSummary.lifetimePoints, 'Lifetime Points')}
+            ${summaryItem('🎁', data.accountSummary.lifetimeRedeemed, 'Đã đổi')}
+            ${summaryItem('🏅', data.accountSummary.level, 'Level')}
+            ${summaryItem('🔥', data.accountSummary.streakDays, 'Streak Days')}
+            ${summaryItem('📋', data.accountSummary.pendingOfferPoints, 'Pending Pts')}
+            ${summaryItem('✅', data.accountSummary.completedOffers + '/' + data.accountSummary.dailyOffersCount, 'Offers Done')}
+            ${summaryItem('🎴', data.accountSummary.punchCardsActive, 'Punch Cards')}
+          </div>
+        `;
+        container.appendChild(summaryCard);
+      }
+
+      // Data section cards
+      const sections = [
+        { key: 'rewards', title: '💰 Rewards Info', icon: '💰' },
+        { key: 'searchProgress', title: '🔍 Search Progress', icon: '🔍' },
+        { key: 'offers', title: '🎯 Offers & Activities', icon: '🎯' },
+        { key: 'streak', title: '🔥 Streak', icon: '🔥' },
+        { key: 'flyoutActivities', title: '📢 Flyout Activities', icon: '📢' },
+        { key: 'pointsBreakdown', title: '📊 Points Breakdown', icon: '📊' },
+        { key: 'redeemHistory', title: '🎁 Redeem History', icon: '🎁' },
+        { key: 'searchHistory', title: '📜 Search History', icon: '📜' },
+        { key: 'streakDetails', title: '📈 Streak Details (Raw)', icon: '📈' },
+        { key: '_meta', title: '⚙️ Metadata & Errors', icon: '⚙️' },
+      ];
+
+      for (const section of sections) {
+        if (!data[section.key]) continue;
+        
+        const sectionData = data[section.key];
+        const jsonStr = syntaxHighlight(JSON.stringify(sectionData, null, 2));
+        const itemCount = typeof sectionData === 'object' ? Object.keys(sectionData).length : 0;
+
+        const card = document.createElement('div');
+        card.className = 'card';
+        card.innerHTML = `
+          <div class="card-header collapsed" onclick="toggleCard(this)">
+            <h3>${section.title} <span class="badge">${itemCount} fields</span></h3>
+            <span class="toggle">▼</span>
+          </div>
+          <div class="card-body collapsed">${jsonStr}</div>
+        `;
+        container.appendChild(card);
+      }
+
+      // Errors
+      if (data._meta?.errors?.length > 0) {
+        const errCard = document.createElement('div');
+        errCard.className = 'card';
+        errCard.innerHTML = `
+          <div class="card-header" onclick="toggleCard(this)">
+            <h3>⚠️ Errors (${data._meta.errors.length})</h3>
+            <span class="toggle">▼</span>
+          </div>
+          <ul class="error-list">
+            ${data._meta.errors.map(e => `<li>❌ ${e.task || e.url}: ${e.error || 'HTTP ' + e.status}</li>`).join('')}
+          </ul>
+        `;
+        container.appendChild(errCard);
+      }
+    }
+
+    function summaryItem(icon, value, label) {
+      const display = value === undefined || value === null ? 'N/A' : 
+        (typeof value === 'number' ? value.toLocaleString() : value);
+      return `<div class="summary-item">
+        <div class="summary-value">${icon} ${display}</div>
+        <div class="summary-label">${label}</div>
+      </div>`;
+    }
+
+    function toggleCard(header) {
+      header.classList.toggle('collapsed');
+      const body = header.nextElementSibling;
+      if (body) body.classList.toggle('collapsed');
+    }
+
+    function syntaxHighlight(json) {
+      return json.replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, (match) => {
+        let cls = 'json-number';
+        if (/^"/.test(match)) {
+          cls = /:$/.test(match) ? 'json-key' : 'json-string';
+        } else if (/true|false/.test(match)) {
+          cls = 'json-bool';
+        } else if (/null/.test(match)) {
+          cls = 'json-null';
+        }
+        return `<span class="${cls}">${match}</span>`;
+      });
+    }
+
+    function downloadData() {
+      if (!extractedData) return;
+      MSDataExtractor.downloadAsFile();
+    }
+
+    function copyData() {
+      if (!extractedData) return;
+      const json = JSON.stringify(extractedData, null, 2);
+      navigator.clipboard.writeText(json).then(() => {
+        const btn = document.getElementById('btn-copy');
+        btn.textContent = '✅ Copied!';
+        setTimeout(() => { btn.innerHTML = '📋 Copy JSON'; }, 2000);
+      });
+    }
+  </script>
+</body>
+</html>
