@@ -1,6 +1,6 @@
 /**
  * BAN DETECTION MODULE — BRC Extension
- * File: reward/extension/ban-detection.js
+ * File: extension/ban-detection.js
  *
  * NHIỆM VỤ:
  *   Phân tích response từ rewards.bing.com/api/getuserinfo
